@@ -67,4 +67,5 @@ def test_prompt_builder_builds_location_rules():
     assert "The location 'Jaipur' IS one of the 41 Rajasthan districts." in prompt
     # Beejasar is not a district
     assert "The location 'Beejasar' is NOT one of the 41 Rajasthan districts." in prompt
+    assert "MULTIPLE VALUE FILTERING RULE:" in prompt
 
