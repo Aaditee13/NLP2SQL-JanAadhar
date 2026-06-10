@@ -18,6 +18,7 @@ def _extract_location_hints(question: str) -> list[str]:
     Extract candidate location tokens from the question.
     Returns a list of raw strings as the user wrote them (case-preserved).
     Tokens that are common stopwords or purely numeric are excluded.
+    Supports coordinate list extraction (e.g. "Srinagar and Beejasar").
     """
     hints: list[str] = []
     seen: set[str] = set()
@@ -30,10 +31,31 @@ def _extract_location_hints(question: str) -> list[str]:
             raw = match.group(1).strip()
             token = " ".join(raw.split()[:3])
             key = token.lower()
-            if key in LOCATION_STOPWORDS or key in seen or not token:
+            if key in LOCATION_STOPWORDS or not token:
                 continue
-            seen.add(key)
-            hints.append(token)
+            if key not in seen:
+                seen.add(key)
+                hints.append(token)
+                
+            # Check for subsequent locations connected by coordinate conjunctions or commas
+            end_pos = match.end(1)
+            remaining = question[end_pos:]
+            while True:
+                conjunction_match = re.match(
+                    r"^\s*(?:and|or|,)\s+([A-Za-z][A-Za-z\s-]{1,30}?)(?:\s+(?:and|or|where|who|that|which|with|having|are|is)\b|[,.]|$)",
+                    remaining,
+                    re.IGNORECASE
+                )
+                if not conjunction_match:
+                    break
+                next_raw = conjunction_match.group(1).strip()
+                next_token = " ".join(next_raw.split()[:3])
+                next_key = next_token.lower()
+                if next_key not in LOCATION_STOPWORDS and next_token:
+                    if next_key not in seen:
+                        seen.add(next_key)
+                        hints.append(next_token)
+                remaining = remaining[conjunction_match.end(1):]
     return hints
 
 
