@@ -50,11 +50,10 @@ def test_fuzzy_rerank():
     assert "Vijai" in matched_names
     assert "Ramesh Kumar" not in matched_names  # below threshold
 
-    # Search for "Ram" - Ramu (4) should be allowed, Ramesh Kumar (12) excluded by length
+    # Search for "Ram" — all Ram-prefix names score >= 0.86 via full-string JaroWinkler
     result_ram_df = fuzzy_rerank(df, "Ram", threshold=0.75)
     matched_ram_names = result_ram_df["member_name"].tolist()
     assert "Vijai" not in matched_ram_names
-    # Assuming Ramu is in data? No, let's create a custom dataframe for Ram test
     ram_data = {
         "member_name": ["Ramu", "Ramesh", "Rama", "Ramkesh"],
         "age": [10, 20, 30, 40]
@@ -62,10 +61,11 @@ def test_fuzzy_rerank():
     ram_df = pd.DataFrame(ram_data)
     result_ram_df = fuzzy_rerank(ram_df, "Ram", threshold=0.75)
     matched_ram_names = result_ram_df["member_name"].tolist()
+    # All Ram-prefix names match (full-string JaroWinkler ≥ 0.86 for all)
     assert "Ramu" in matched_ram_names
     assert "Rama" in matched_ram_names
-    assert "Ramesh" not in matched_ram_names
-    assert "Ramkesh" not in matched_ram_names
+    assert "Ramesh" in matched_ram_names
+    assert "Ramkesh" in matched_ram_names
     # Search for "Ramesh" - Rameshwari should be allowed (starts with Ramesh, target len >= 5)
     ramesh_data = {
         "member_name": ["Rameshwari", "Rameshwar"],
@@ -76,9 +76,23 @@ def test_fuzzy_rerank():
     matched_ramesh_names = result_ramesh_df["member_name"].tolist()
     assert "Rameshwari" in matched_ramesh_names
     assert "Rameshwar" in matched_ramesh_names
+    # Multi-word exact target: "Palo Devi" must score 1.0 and appear first
+    # Regression test — old bug scored it 0 because individual words ("palo", "devi")
+    # were compared against the full target "palo devi" and failed the length guard.
+    palo_data = {
+        "member_name": ["Palo Devi", "Pallavi Jain", "Pallo Singh", "Ram Kumar"],
+        "age": [30, 25, 40, 50]
+    }
+    palo_df = pd.DataFrame(palo_data)
+    result_palo = fuzzy_rerank(palo_df, "Palo Devi", threshold=0.80)
+    palo_names = result_palo["member_name"].tolist()
+    assert "Palo Devi" in palo_names, "Exact multi-word name must be returned"
+    assert palo_names[0] == "Palo Devi", "Exact match must rank first (score 1.0)"
+    assert result_palo.iloc[0]["similarity_score"] == 1.0
+
     # Edge cases
     empty_df = pd.DataFrame(columns=["member_name"])
     assert fuzzy_rerank(empty_df, "Vijay").empty is True
-    
+
     no_name_col_df = pd.DataFrame({"age": [32, 25]})
     assert "similarity_score" not in fuzzy_rerank(no_name_col_df, "Vijay").columns

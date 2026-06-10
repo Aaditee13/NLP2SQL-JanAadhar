@@ -62,6 +62,12 @@ def fuzzy_rerank(
     Calculates Jaro-Winkler similarity scores between target_name and values in the
     first detected name column of the DataFrame. Filters by threshold, sorts descending,
     and returns up to max_rows.
+
+    Two scoring strategies are combined (best wins):
+      1. Full-string match: compare entire DB name against entire target.
+         Catches "Palo Devi" == "Palo Devi" (exact) and close full-name variants.
+      2. Per-word cross match: compare each target word against each DB name word.
+         Catches single-word targets against multi-word DB names (e.g. "Palo" → "Palo Devi").
     """
     if df.empty or not target_name:
         return df
@@ -69,7 +75,7 @@ def fuzzy_rerank(
     # Detect name column
     name_cols = ["member_name", "father_name", "mother_name", "spouse_name", "family_head_name"]
     df_cols_lower = {col.lower(): col for col in df.columns}
-    
+
     match_col = None
     for col_key in name_cols:
         if col_key in df_cols_lower:
@@ -87,7 +93,9 @@ def fuzzy_rerank(
         return df
 
     target_lower = target_name.lower()
+    target_words = [w.strip() for w in target_lower.split() if w.strip()]
     max_len_diff = 2 if len(target_name) <= 5 else 3
+
     scores = []
     for val in df[match_col]:
         if pd.isna(val) or not isinstance(val, str):
@@ -95,19 +103,31 @@ def fuzzy_rerank(
         else:
             val_clean = val.strip()
             val_lower = val_clean.lower()
-            words = [w.strip() for w in val_lower.split() if w.strip()]
-            
+            val_words = [w.strip() for w in val_lower.split() if w.strip()]
+
+            # Strategy 1: full-string score
+            # "Palo Devi" vs "Palo Devi" → 1.0 (exact)
+            # "Pallavi Jain" vs "Palo Devi" → ~0.72 (partial)
+            full_score = JaroWinkler.similarity(target_lower, val_lower)
+            if full_score > 1.0:
+                full_score = full_score / 100.0
+
+            # Strategy 2: per-word cross score
+            # Each target word vs each DB name word independently.
+            # Handles: single-word target "Palo" → ["Palo", "Devi"] finds "Palo" at 1.0
             best_word_score = 0.0
-            for word in words:
-                len_diff = abs(len(word) - len(target_lower))
-                is_prefix_match = len(target_lower) >= 5 and word.startswith(target_lower)
-                if len_diff <= max_len_diff or is_prefix_match:
-                    score = JaroWinkler.similarity(target_lower, word)
-                    if score > 1.0:
-                        score = score / 100.0
-                    if score > best_word_score:
-                        best_word_score = score
-            scores.append(best_word_score)
+            for t_word in target_words:
+                for v_word in val_words:
+                    len_diff = abs(len(v_word) - len(t_word))
+                    is_prefix_match = len(t_word) >= 4 and v_word.startswith(t_word)
+                    if len_diff <= max_len_diff or is_prefix_match:
+                        score = JaroWinkler.similarity(t_word, v_word)
+                        if score > 1.0:
+                            score = score / 100.0
+                        if score > best_word_score:
+                            best_word_score = score
+
+            scores.append(max(full_score, best_word_score))
 
     df_copy = df.copy()
     df_copy["similarity_score"] = scores
