@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import argparse
+import re
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any
 
 from config.settings import settings
 from database.excel_importer import import_excel_dataset
@@ -13,11 +16,12 @@ from optimization.query_optimizer import OptimizationReport, QueryOptimizer
 from prompting.prompt_builder import PromptBuilder
 from retrieval.schema_retriever import SchemaRetriever
 from validation.sql_validator import SQLValidator
+from retrieval.few_shot_retriever import FaissFewShotStore, FewShotRetriever
+from caching.semantic_cache import FaissCacheStore, SemanticCache
 
 from database.schema_metadata import RAJASTHAN_DISTRICTS_41
 
 # ── Module-level lookups ─────────────────────────────────────────────────────
-# Pre-built for O(1) access inside _post_process_sql on every call.
 _DISTRICTS_LOWER    = {d.lower() for d in RAJASTHAN_DISTRICTS_41}
 _DISTRICT_CANONICAL = {d.lower(): d for d in RAJASTHAN_DISTRICTS_41}
 
@@ -25,11 +29,6 @@ _DISTRICT_CANONICAL = {d.lower(): d for d in RAJASTHAN_DISTRICTS_41}
 _NO_BANK_WORDS = [
     "no bank", "without bank", "don't have", "do not have",
     "no account", "unbanked", "without account",
-]
-
-# Phrases that signal the user explicitly asked about member_type
-_MEMBER_TYPE_WORDS = [
-    "regular member", "mem type", "member type", "hof", "head of family",
 ]
 
 _CASTE_GROUPS = [
@@ -56,7 +55,6 @@ _CASTE_GROUPS = [
 ]
 
 
-
 @dataclass
 class PipelineOutput:
     question: str
@@ -70,89 +68,87 @@ class PipelineOutput:
     optimization: OptimizationReport | None
     is_fuzzy: bool = False
     fuzzy_target: str | None = None
+    source: str = "llm"
 
+
+def _replace_outside_quotes(pattern_word: str, replacement: str, text: str) -> str:
+    """
+    Replace whole word pattern_word with replacement in text, but ONLY outside
+    of single-quoted or double-quoted string literals.
+    """
+    import re
+    # Match quoted string literals first, or target whole word
+    regex = re.compile(rf"('[^']*'|\"[^\"]*\")|\b{pattern_word}\b", re.IGNORECASE)
+    return regex.sub(lambda m: m.group(1) if m.group(1) is not None else replacement, text)
 
 
 def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
     """
-    Post-process LLM-generated SQL to fix predictable systematic errors:
-    1. Free-text columns: always use LIKE for partial matching
-    2. bank_name: always case-insensitive via UPPER()
-    3. Categorical casing: normalize all variants of gender, caste_category, marital_status
-    4. education: fix the 'illiterate' lowercase anomaly; LIKE for all others
-    5. is_rural: map text/boolean to integer 0 or 1
-    6. District casing: fix case of known Rajasthan district names
-    7. District redirect: non-district locations → block OR village search
+    Post-process LLM-generated SQL for the single flat citizen table.
     """
     import re
 
-    # ── Step 0: Fix mismatched table aliases for columns ─────────────────────
-    _COL_TO_TABLE = {}
-    _MEMBER_COLS = {
-        "member_name", "father_name", "mother_name", "spouse_name", "date_of_birth", "age",
-        "gender", "mobile_number", "caste_category", "marital_status",
-        "member_type", "relation_with_hof", "caste", "income", "occupation",
-        "minority", "education", "jan_aadhaar_member_id"
-    }
-    _FAMILY_COLS = {
-        "jan_aadhaar_number", "family_head_name", "district",
-        "city", "block", "gram_panchayat", "village", "ward", "is_rural"
-    }
-    _BANK_COLS = {
-        "bank_id", "bank_account", "bank_name", "ifsc_code", "dbt_status"
-    }
-    for c in _MEMBER_COLS:
-        _COL_TO_TABLE[c] = "member"
-    for c in _FAMILY_COLS:
-        _COL_TO_TABLE[c] = "family"
-    for c in _BANK_COLS:
-        _COL_TO_TABLE[c] = "bank_details"
+    # ── Normalize legacy multi-table qualifiers ──
+    # Map family, member, bank_details table prefixes to flat attributes
+    sql = re.sub(r"\bmember\.member_name\b", "name_en", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.father_name\b", "father_name_en", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.mother_name\b", "mother_name_en", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.spouse_name\b", "spouce_name_en", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.date_of_birth\b", "dob", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.mobile_number\b", "mobile_no", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bbank_details\.bank_name\b", "bank", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bbank_details\.bank_account\b", "account_no", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bbank_details\.ifsc_code\b", "ifsc_code", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.district\b", "district_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.city\b", "city_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.block\b", "block_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.gram_panchayat\b", "gp_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.village\b", "vill_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.ward\b", "ward_name_eng", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.is_rural\b", "is_rural", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bfamily\.jan_aadhaar_number\b", "enrollment_id", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.jan_aadhaar_member_id\b", "jan_aadhaar_member_id", sql, flags=re.IGNORECASE)
+    
+    sql = _replace_outside_quotes("member_name", "name_en", sql)
+    sql = _replace_outside_quotes("father_name", "father_name_en", sql)
+    sql = _replace_outside_quotes("mother_name", "mother_name_en", sql)
+    sql = _replace_outside_quotes("spouse_name", "spouce_name_en", sql)
+    sql = _replace_outside_quotes("spouce_name", "spouce_name_en", sql)
+    sql = _replace_outside_quotes("bank_name", "bank", sql)
+    sql = _replace_outside_quotes("bank_account", "account_no", sql)
+    sql = _replace_outside_quotes("district", "district_name_eng", sql)
+    sql = _replace_outside_quotes("city", "city_name_eng", sql)
+    sql = _replace_outside_quotes("block", "block_name_eng", sql)
+    sql = _replace_outside_quotes("gram_panchayat", "gp_name_eng", sql)
+    sql = _replace_outside_quotes("village", "vill_name_eng", sql)
+    sql = _replace_outside_quotes("ward", "ward_name_eng", sql)
+    sql = _replace_outside_quotes("jan_aadhaar_number", "enrollment_id", sql)
+    sql = _replace_outside_quotes("mobile_number", "mobile_no", sql)
+    sql = _replace_outside_quotes("member_type", "mem_type", sql)
 
-    alias_to_table = {}
-    table_to_alias = {}
-    for table_name in ["member", "family", "bank_details"]:
-        match = re.search(rf"\b{table_name}\s+(?:AS\s+)?(\w+)\b", sql, re.IGNORECASE)
-        if match:
-            alias = match.group(1)
-            if alias.upper() not in {"JOIN", "ON", "WHERE", "GROUP", "ORDER", "LIMIT", "SELECT", "FROM", "INNER", "LEFT", "RIGHT", "CROSS", "OUTER", "NATURAL", "AS"}:
-                alias_to_table[alias.lower()] = table_name
-                table_to_alias[table_name] = alias
+    # Clean up multi-table qualifiers (e.g. member.age -> age)
+    sql = re.sub(r"\b(?:member|family|bank_details)\.(\w+)\b", r"\1", sql, flags=re.IGNORECASE)
 
-    def prefix_replacer(match):
-        alias = match.group(1)
-        col = match.group(2).lower()
-        owner_table = _COL_TO_TABLE.get(col)
-        if owner_table:
-            current_table = alias_to_table.get(alias.lower())
-            if current_table != owner_table:
-                correct_alias = table_to_alias.get(owner_table, owner_table)
-                return f"{correct_alias}.{match.group(2)}"
-        return match.group(0)
-
-    sql = re.sub(r"\b(\w+)\.(\w+)\b", prefix_replacer, sql)
-
-    # ── Step 1: Free-text columns → LIKE '%val%' ─────────────────────────────
-    # Exact '=' will fail for names, castes, villages, occupations etc. because
-    # the DB has mixed casing, full names with suffixes, and spelling variants.
+    # ── Step 1: Free-text columns → LIKE '%val%' ──
     def text_replacer(match):
         col = match.group(1)
         val = match.group(2)
         return f"{col} LIKE '%{val}%'"
 
     _FREE_TEXT_COLS = (
-        "member_name|father_name|mother_name|spouse_name|family_head_name"
-        "|caste|city|block|gram_panchayat|village|occupation"
+        "name_en|father_name_en|mother_name_en|spouce_name_en"
+        "|caste|city_name_eng|block_name_eng|gp_name_eng|vill_name_eng|occupation"
     )
     sql = re.sub(
-        rf"\b((?:\w+\.)?(?:{_FREE_TEXT_COLS}))\s*=\s*'([^']+)'",
+        rf"\b({_FREE_TEXT_COLS})\s*=\s*'([^']+)'",
         text_replacer, sql, flags=re.IGNORECASE,
     )
     sql = re.sub(
-        rf'\b((?:\w+\.)?(?:{_FREE_TEXT_COLS}))\s*=\s*"([^"]+)"',
+        rf'\b({_FREE_TEXT_COLS})\s*=\s*"([^"]+)"',
         text_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 1.0: Fuzzy Name Broadening ──────────────────────────────────────
+    # ── Step 1.0: Fuzzy Name Broadening ──
     if fuzzy_target:
         prefix = fuzzy_target[:3]
         target_lower = fuzzy_target.lower()
@@ -166,14 +162,13 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
             if score >= 0.60 or val.lower() in target_lower or target_lower in val.lower():
                 return f"{col_part} LIKE '%{prefix}%'"
             return match.group(0)
-        _NAME_COLS = "member_name|father_name|mother_name|spouse_name|family_head_name"
+        _NAME_COLS = "name_en|father_name_en|mother_name_en|spouce_name_en"
         sql = re.sub(
-            rf"\b((?:\w+\.)?(?:{_NAME_COLS}))\s+LIKE\s+'%?([^'%]+)%?'",
+            rf"\b({_NAME_COLS})\s+LIKE\s+'%?([^'%]+)%?'",
             fuzzy_repl, sql, flags=re.IGNORECASE,
         )
 
-    # ── Step 1.1: Caste IN Clause Expansion ──────────────────────────────────
-    # Replaces IN clauses for castes with the full bilingual groups.
+    # ── Step 1.1: Caste IN Clause Expansion ──
     def caste_in_replacer(match):
         col = match.group(1)
         in_content = match.group(2)
@@ -198,13 +193,11 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         return "(" + " OR ".join(all_conditions) + ")"
 
     sql = re.sub(
-        r"\b((?:\w+\.)?caste)\s+IN\s+\(([^)]+)\)",
+        r"\b(caste)\s+IN\s+\(([^)]+)\)",
         caste_in_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 1.2: Caste Bilingual Expansion ──────────────────────────────────
-
-    # Expands single-language caste filters to search in both English and Hindi.
+    # ── Step 1.2: Caste Bilingual Expansion ──
     def caste_bilingual_replacer(match):
         col = match.group(1)
         val = match.group(2).strip()
@@ -219,83 +212,30 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         return match.group(0)
 
     sql = re.sub(
-        r"\b((?:\w+\.)?caste)\s+LIKE\s+'%?([^'%]+)%?'",
+        r"\b(caste)\s+LIKE\s+'%?([^'%]+)%?'",
         caste_bilingual_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 1.5: Strip spurious IS NOT NULL on nullable location sub-columns ─
-    # The LLM sometimes adds conditions like `f.block IS NOT NULL` or
-    # `f.ward IS NOT NULL` when it JOINs the family table but has no real
-    # location filter to apply. Remove these as they silently exclude families
-    # that have no block/ward recorded (rural-only or urban-only families).
-    _NULLABLE_LOC_COLS = r"block|ward|village|gram_panchayat|city"
-    sql = re.sub(
-        rf"\s+AND\s+(?:\w+\.)?(?:{_NULLABLE_LOC_COLS})\s+IS\s+NOT\s+NULL\b",
-        "",
-        sql, flags=re.IGNORECASE,
-    )
-
-    # ── Step 1.6: Prune redundant family JOIN ────────────────────────────────
-    # The LLM sometimes joins the family table when it retrieves family_id context,
-    # but does not reference any family columns in SELECT, WHERE, or other clauses.
-    if "family" in sql.lower():
-        family_join_pat = re.compile(
-            r"\b(?:INNER\s+|LEFT\s+|RIGHT\s+|CROSS\s+)?JOIN\s+family\s*(?:\s+(?:AS\s+)?(\w+))?\s+ON\s+([\w.]+)\s*=\s*([\w.]+)",
-            re.IGNORECASE
-        )
-        match = family_join_pat.search(sql)
-        if match:
-            alias = match.group(1)
-            identifier = alias if alias else "family"
-            start, end = match.span()
-            rest_of_sql = sql[:start] + sql[end:]
-            
-            # Check if the identifier is referenced with a dot prefix elsewhere
-            has_qualifier_ref = re.search(rf"\b{re.escape(identifier)}\.", rest_of_sql, re.IGNORECASE) is not None
-            
-            # Check if any non-join columns of the family table are referenced as standalone words
-            _FAMILY_COLUMNS = {
-                "jan_aadhaar_number", "family_head_name", "district", "city",
-                "block", "gram_panchayat", "village", "ward", "is_rural"
-            }
-            has_column_ref = False
-            for col in _FAMILY_COLUMNS:
-                if re.search(rf"\b{col}\b", rest_of_sql, re.IGNORECASE):
-                    has_column_ref = True
-                    break
-            
-            if not has_qualifier_ref and not has_column_ref:
-                # The join is completely unused! Strip it.
-                sql = rest_of_sql
-                # Clean up spacing around the removed JOIN
-                sql = re.sub(r"\s+", " ", sql).strip()
-                if sql.endswith("; ") or sql.endswith(";"):
-                    sql = sql.rstrip("; ").rstrip(";") + ";"
-
-    # ── Step 2: bank_name → UPPER(col) LIKE '%UPPER_VAL%' ───────────────────
-    # Bank names are stored inconsistently (UPPER, Title, mixed) in real data.
-    # Wrapping both sides in UPPER() guarantees a case-insensitive match.
+    # ── Step 2: bank → UPPER(col) LIKE '%UPPER_VAL%' ──
     def bank_replace_safe(match):
         col = match.group(1)
         val = match.group(2).strip()
         return f"UPPER({col}) LIKE '%{val.upper()}%'"
 
     sql = re.sub(
-        r"\b((?:\w+\.)?bank_name)\s*=\s*'([^']+)'",
+        r"\b(bank)\s*=\s*'([^']+)'",
         bank_replace_safe, sql, flags=re.IGNORECASE,
     )
-    # Also normalize existing LIKE patterns that aren't already UPPER-wrapped
     sql = re.sub(
-        r"\b((?:\w+\.)?bank_name)\s*LIKE\s*'%([^'%]+)%'",
+        r"\b(bank)\s*LIKE\s*'%([^'%]+)%'",
         lambda m: (
             m.group(0) if m.group(0).upper().startswith("UPPER(")
             else f"UPPER({m.group(1)}) LIKE '%{m.group(2).strip().upper()}%'"
         ),
         sql, flags=re.IGNORECASE,
     )
-    # Fix LIKE 'val' without wildcards (e.g. bank_name LIKE 'SBI')
     sql = re.sub(
-        r"\b((?:\w+\.)?bank_name)\s*LIKE\s*'([^'%]+)'",
+        r"\b(bank)\s*LIKE\s*'([^'%]+)'",
         lambda m: (
             m.group(0) if m.group(0).upper().startswith("UPPER(")
             else f"UPPER({m.group(1)}) LIKE '%{m.group(2).strip().upper()}%'"
@@ -303,7 +243,7 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 2.5 (new): bank_name IN (...) → UPPER(bank_name) IN (...) ─────────────
+    # ── Step 2.5: bank IN (...) → UPPER(bank) IN (...) ──
     def bank_in_replacer(match):
         col = match.group(1)
         in_content = match.group(2)
@@ -312,13 +252,11 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         return f"UPPER({col}) IN ({', '.join(new_vals)})"
 
     sql = re.sub(
-        r"\b((?:\w+\.)?bank_name)\s+IN\s+\(([^)]+)\)",
+        r"\b(bank)\s+IN\s+\(([^)]+)\)",
         bank_in_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 3: Categorical value normalization ───────────────────────────────
-    # The real dataset will have GEN/General/GENERAL/general, Widow/widow/WIDOW,
-    # Male/male/MALE, etc. Normalize everything to the canonical stored value.
+    # ── Step 3: Categorical value normalization ──
     def cat_replacer(match):
         col_raw = match.group(1)
         col = col_raw.lower()
@@ -332,28 +270,20 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
                 return f"{col_raw} = 'Female'"
 
         elif "caste_category" in col:
-            # All SC variants
             if val_l in ("sc", "scheduled caste", "dalit"):
                 return f"{col_raw} = 'SC'"
-            # All ST variants
             if val_l in ("st", "scheduled tribe", "tribal", "adivasi"):
                 return f"{col_raw} = 'ST'"
-            # All OBC variants
-            if val_l in ("obc", "other backward class", "other backward caste",
-                         "other backward", "backward class"):
+            if val_l in ("obc", "other backward class", "other backward caste", "other backward", "backward class"):
                 return f"{col_raw} = 'OBC'"
-            # All GEN variants — this is the most common mismatch
-            if val_l in ("gen", "general", "general category", "open",
-                         "unreserved", "ur", "forward", "forward caste"):
+            if val_l in ("gen", "general", "general category", "open", "unreserved", "ur", "forward", "forward caste"):
                 return f"{col_raw} = 'GEN'"
-            # Handle UPPER() already applied: SC/ST/OBC/GEN exact
             return f"{col_raw} = '{val.upper()}'"
 
         elif "marital_status" in col:
             if val_l in ("married",):
                 return f"{col_raw} = 'Married'"
-            if val_l in ("unmarried", "single", "never married", "bachelor",
-                         "spinster"):
+            if val_l in ("unmarried", "single", "never married", "bachelor", "spinster"):
                 return f"{col_raw} = 'Unmarried'"
             if val_l in ("widow", "widowed", "widower"):
                 return f"{col_raw} = 'Widow'"
@@ -362,15 +292,15 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
 
     _CAT_COLS = r"gender|caste_category|marital_status"
     sql = re.sub(
-        rf"\b((?:\w+\.)?(?:{_CAT_COLS}))\s*=\s*'([^']+)'",
+        rf"\b({_CAT_COLS})\s*=\s*'([^']+)'",
         cat_replacer, sql, flags=re.IGNORECASE,
     )
     sql = re.sub(
-        rf'\b((?:\w+\.)?(?:{_CAT_COLS}))\s*=\s*"([^"]+)"',
+        rf'\b({_CAT_COLS})\s*=\s*"([^"]+)"',
         cat_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 3.5: Categorical IN Clause Casing Normalization ──────────────────
+    # ── Step 3.5: Categorical IN Clause Casing Normalization ──
     def cat_in_replacer(match):
         col_raw = match.group(1)
         col = col_raw.lower()
@@ -412,49 +342,42 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
                 
         return f"{col_raw} IN ({', '.join(new_vals)})"
 
-    _CAT_COLS = r"gender|caste_category|marital_status"
     sql = re.sub(
-        rf"\b((?:\w+\.)?(?:{_CAT_COLS}))\s+IN\s+\(([^)]+)\)",
+        rf"\b({_CAT_COLS})\s+IN\s+\(([^)]+)\)",
         cat_in_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 4 (new): Categorical LIKE → = ────────────────────────────────
-    # The LLM sometimes uses LIKE for exact-match categorical columns.
-    # gender, caste_category, marital_status must always use = not LIKE.
+    # ── Step 4: Categorical LIKE → = ──
     sql = re.sub(
-        r"\b((?:\w+\.)?gender)\s+LIKE\s+'%?(Male|Female)%?'",
+        r"\b(gender)\s+LIKE\s+'%?(Male|Female)%?'",
         lambda m: f"{m.group(1)} = '{m.group(2)}'",
         sql, flags=re.IGNORECASE,
     )
     sql = re.sub(
-        r"\b((?:\w+\.)?caste_category)\s+LIKE\s+'%?(SC|ST|OBC|GEN)%?'",
+        r"\b(caste_category)\s+LIKE\s+'%?(SC|ST|OBC|GEN)%?'",
         lambda m: f"{m.group(1)} = '{m.group(2).upper()}'",
         sql, flags=re.IGNORECASE,
     )
     sql = re.sub(
-        r"\b((?:\w+\.)?marital_status)\s+LIKE\s+'%?(Married|Unmarried|Widow)%?'",
+        r"\b(marital_status)\s+LIKE\s+'%?(Married|Unmarried|Widow)%?'",
         lambda m: f"{m.group(1)} = '{m.group(2)}'",
         sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 4: education — 'illiterate' is stored lowercase; others Title Case ─
-    # Use LOWER() for illiterate to match regardless of DB casing.
-    # For all other education values use LIKE for partial/case-insensitive match.
+    # ── Step 4.5: education — 'illiterate' lowercase, others Title Case ──
     def edu_replacer(match):
         col = match.group(1)
         val = match.group(2).strip()
         if val.lower() == "illiterate":
             return f"LOWER({col}) = 'illiterate'"
-        # For education already handled by Step 1 LIKE rewrite, this won't fire.
-        # This handles any remaining exact = 'Graduate' etc.
         return f"{col} LIKE '%{val}%'"
 
     sql = re.sub(
-        r"\b((?:\w+\.)?education)\s*=\s*'([^']+)'",
+        r"\b(education)\s*=\s*'([^']+)'",
         edu_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 5: is_rural — DB stores INTEGER 0 (urban) or 1 (rural) ──────────
+    # ── Step 5: is_rural ──
     def rural_replacer(match):
         col = match.group(1)
         val = match.group(2).strip().lower().strip("'\"")
@@ -465,32 +388,29 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         return match.group(0)
 
     sql = re.sub(
-        r"\b((?:\w+\.)?is_rural)\s*(?:=|LIKE)\s*['\"]?(\w+)['\"]?",
+        r"\b(is_rural)\s*(?:=|LIKE)\s*['\"]?(\w+)['\"]?",
         rural_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 6: District casing normalisation (known districts only) ────────
+    # ── Step 6: District casing normalisation ──
     def district_exact_replacer(match: re.Match[str]) -> str:
         col = match.group(1)
         val = match.group(2).strip().lower()
-        canonical = _DISTRICT_CANONICAL.get(val)   # O(1) dict lookup
+        canonical = _DISTRICT_CANONICAL.get(val)
         if canonical:
             return f"{col} = '{canonical}'"
-        # Not a known district — Step 9 will redirect it
         return match.group(0)
 
     sql = re.sub(
-        r"\b((?:\w+\.)?district)\s*=\s*'([^']+)'",
+        r"\b(district_name_eng)\s*=\s*'([^']+)'",
         district_exact_replacer, sql, flags=re.IGNORECASE,
     )
     sql = re.sub(
-        r'\b((?:\w+\.)?district)\s*=\s*"([^"]+)"',
+        r'\b(district_name_eng)\s*=\s*"([^"]+)"',
         district_exact_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 8 (new): District LIKE → = for known districts ──────────────
-    # Convert "district LIKE '%Jaipur%'" → "district = 'Jaipur'" when the
-    # stripped value is a known district, preventing partial-match false positives.
+    # ── Step 8: District LIKE → = ──
     def district_like_replacer(match: re.Match[str]) -> str:
         col = match.group(1)
         val = match.group(2).strip()
@@ -500,16 +420,14 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
         return match.group(0)
 
     sql = re.sub(
-        r"\b((?:\w+\.)?district)\s+LIKE\s+'%?([^'%]+?)%?'",
+        r"\b(district_name_eng)\s+LIKE\s+'%?([^'%]+?)%?'",
         district_like_replacer, sql, flags=re.IGNORECASE,
     )
 
-    # ── Step 8.5: Redirect district IN clauses containing non-district values ─
+    # ── Step 8.5: Redirect district IN clauses containing non-district values ──
     def district_in_replacer(match: re.Match[str]) -> str:
         col = match.group(1)
         in_content = match.group(2)
-        prefix = col.split('.')[0] + "." if '.' in col else ""
-        
         vals = [v[0] or v[1] for v in re.findall(r"'([^']+)'|\"([^\"]+)\"", in_content)]
         if not vals:
             return match.group(0)
@@ -524,207 +442,207 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
                     canonical = _DISTRICT_CANONICAL[val_l]
                     conditions.append(f"{col} = '{canonical}'")
                 else:
-                    conditions.append(f"({prefix}block LIKE '%{val}%' OR {prefix}village LIKE '%{val}%')")
+                    conditions.append(f"(block_name_eng LIKE '%{val}%' OR vill_name_eng LIKE '%{val}%')")
             return "(" + " OR ".join(conditions) + ")"
         else:
             new_vals = [f"'{_DISTRICT_CANONICAL[v.lower()]}'" for v in vals]
             return f"{col} IN ({', '.join(new_vals)})"
 
     sql = re.sub(
-        r"\b((?:\w+\.)?district)\s+IN\s+\(([^)]+)\)",
+        r"\b(district_name_eng)\s+IN\s+\(([^)]+)\)",
         district_in_replacer, sql, flags=re.IGNORECASE,
     )
 
     # ── Step 9: Redirect district → block/village for non-district locations ──
-    # (previously Step 7 — now uses module-level _DISTRICTS_LOWER)
     redirect_pattern = (
-        r"\b((?:[A-Za-z_]\w*\.)?)"
-        r"district\s*(?:=\s*'([^']+)'|LIKE\s*'%([^'%]+)%')"
+        r"\b"
+        r"district_name_eng\s*(?:=\s*'([^']+)'|LIKE\s*'%([^'%]+)%')"
     )
 
     def district_redirect_full(match: re.Match[str]) -> str:
-        prefix = match.group(1) or ""
-        val = (match.group(2) or match.group(3) or "").strip()
+        val = (match.group(1) or match.group(2) or "").strip()
         if not val or val.lower() in _DISTRICTS_LOWER:
             return match.group(0)
-        return f"({prefix}block LIKE '%{val}%' OR {prefix}village LIKE '%{val}%')"
+        return f"(block_name_eng LIKE '%{val}%' OR vill_name_eng LIKE '%{val}%')"
 
     sql = re.sub(redirect_pattern, district_redirect_full, sql, flags=re.IGNORECASE)
 
-    # ── Steps 10-15 (new): Family member count post-processing ───────────────
+    # ── Steps 10-15: aggregates ──
+    sql = re.sub(r"COUNT\s*\(\s*member_id\s*\)", "COUNT(*)", sql, flags=re.IGNORECASE)
 
-    # Step 10: COUNT(member.member_id) → COUNT(*)
-    sql = re.sub(
-        r"COUNT\s*\(\s*member\.member_id\s*\)",
-        "COUNT(*)",
-        sql, flags=re.IGNORECASE,
-    )
-
-    # Step 11: Fix broken AVG subquery alias (e.g. AVG(T2.member_count) when alias is T1).
-    # Detects the actual subquery alias from the AS clause and substitutes it.
-    def fix_avg_alias(sql_str: str) -> str:
-        inner_match = re.search(r'\)\s+AS\s+(\w+)\s*$', sql_str.rstrip(';'), re.IGNORECASE)
-        if inner_match:
-            correct_alias = inner_match.group(1)
-            sql_str = re.sub(
-                r'AVG\s*\(\s*(\w+)\.member_count\s*\)',
-                lambda m: (
-                    f"AVG({correct_alias}.member_count)"
-                    if m.group(1).lower() != correct_alias.lower()
-                    else m.group(0)
-                ),
-                sql_str, flags=re.IGNORECASE,
-            )
-        return sql_str
-
-    sql = fix_avg_alias(sql)
-
-    # Step 12: Rename misleading 'family_count' alias → 'member_count'
+    # Rename misleading family_count -> member_count
     sql = re.sub(
         r"COUNT\(\*\)\s+AS\s+family_count",
         "COUNT(*) AS member_count",
         sql, flags=re.IGNORECASE,
     )
 
-    # Step 13 and Step 14 removed: family count queries now use only the member
-    # table (GROUP BY member.family_id) so family_id in SELECT is correct.
-    # No JOIN to family table means family_head_name is not available to substitute.
+    # ── Clean up bank terms ──
+    sql = re.sub(r"\bbank_account_number\b", "account_no", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bbank_account_no\b", "account_no", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bbank_account\b", "account_no", sql, flags=re.IGNORECASE)
 
-    # Step 15: Remove unnecessary 'AS display_column' alias
-    sql = re.sub(
-        r"\b(\w+\.family_head_name)\s+AS\s+display_column\b",
-        r"\1",
-        sql, flags=re.IGNORECASE,
-    )
-
-    # ── Step 16: Normalize bank account number column names ───────────────────
-    sql = re.sub(r"\bbank_account_number\b", "bank_account", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bbank_account_no\b", "bank_account", sql, flags=re.IGNORECASE)
-
-    # ── Step 17: Clean up trailing commentary/notes ──────────────────────────
+    # Remove trailing comments
     if ";" in sql:
         parts = sql.split(";", 1)
         sql = parts[0].strip() + ";"
 
-    # ── Step 18: Transitively inject family/member JOINs if referenced but missing ──
-    member_alias = table_to_alias.get("member", "member")
-    family_alias = table_to_alias.get("family")
-    has_family_ref = re.search(r"\b(?:family|f)\.\w+\b", sql, re.IGNORECASE) is not None
-    has_family_join = re.search(r"\b(?:JOIN|FROM)\s+family\b", sql, re.IGNORECASE) is not None
-    if has_family_ref and not has_family_join:
-        f_alias = family_alias if family_alias else "f"
-        join_str = f" JOIN family {f_alias} ON {member_alias}.family_id = {f_alias}.family_id"
-        where_match = re.search(r"\b(WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT)\b", sql, re.IGNORECASE)
-        if where_match:
-            start = where_match.start()
-            sql = sql[:start] + join_str + " " + sql[start:]
-            table_to_alias["family"] = f_alias
-            alias_to_table[f_alias.lower()] = "family"
-        else:
-            sql = sql.rstrip(";") + join_str + ";"
-
-    has_member_ref = re.search(r"\b(?:member|m)\.\w+\b", sql, re.IGNORECASE) is not None
-    has_member_join = re.search(r"\b(?:JOIN|FROM)\s+member\b", sql, re.IGNORECASE) is not None
-    if has_member_ref and not has_member_join:
-        m_alias = member_alias if member_alias else "m"
-        if "family" in sql.lower():
-            f_alias = table_to_alias.get("family", "family")
-            join_str = f" JOIN member {m_alias} ON {m_alias}.family_id = {f_alias}.family_id"
-        elif "bank_details" in sql.lower():
-            b_alias = table_to_alias.get("bank_details", "bank_details")
-            join_str = f" JOIN member {m_alias} ON {b_alias}.member_id = {m_alias}.member_id"
-        else:
-            join_str = ""
-        if join_str:
-            where_match = re.search(r"\b(WHERE|GROUP\s+BY|ORDER\s+BY|LIMIT)\b", sql, re.IGNORECASE)
-            if where_match:
-                start = where_match.start()
-                sql = sql[:start] + join_str + " " + sql[start:]
-                table_to_alias["member"] = m_alias
-                alias_to_table[m_alias.lower()] = "member"
-            else:
-                sql = sql.rstrip(";") + join_str + ";"
-
-    # ── Step 19: Re-run prefix correction to handle any injected tables ───────
-    alias_to_table.clear()
-    table_to_alias.clear()
-    for table_name in ["member", "family", "bank_details"]:
-        match = re.search(rf"\b{table_name}\s+(?:AS\s+)?(\w+)\b", sql, re.IGNORECASE)
-        if match:
-            alias = match.group(1)
-            if alias.upper() not in {"JOIN", "ON", "WHERE", "GROUP", "ORDER", "LIMIT", "SELECT", "FROM", "INNER", "LEFT", "RIGHT", "CROSS", "OUTER", "NATURAL", "AS"}:
-                alias_to_table[alias.lower()] = table_name
-                table_to_alias[table_name] = alias
-
-    sql = re.sub(r"\b(\w+)\.(\w+)\b", prefix_replacer, sql)
-
     return sql
+
+
+def _is_streamlit() -> bool:
+    try:
+        from streamlit.runtime.scriptrunner import get_script_run_ctx
+        return get_script_run_ctx() is not None
+    except Exception:
+        return False
 
 
 def _fix_no_bank_sql(sql: str, question: str) -> str:
     """
-    Post-process SQL for "no bank account" / unbanked queries.
-    Ensures LEFT JOIN is used (not INNER JOIN / bare JOIN) and that
-    bank_details.bank_id IS NULL is included in the WHERE clause.
-    Called immediately after _post_process_sql in the generation loop.
+    Ensure "no bank account" queries filter by account_no IS NULL.
     """
-    import re
-
     if not any(w in question.lower() for w in _NO_BANK_WORDS):
         return sql
+        
+    # If the SQL already checks for account_no IS NULL, we're good
+    if "account_no is null" in sql.lower() or "bank is null" in sql.lower():
+        sql = re.sub(r"\bbank\s+is\s+null\b", "account_no IS NULL", sql, flags=re.IGNORECASE)
+        return sql
 
-    # ── Step 1: Inject bank_details LEFT JOIN if LLM omitted it entirely ─────
-    if "bank_details" not in sql.lower():
-        # BUG FIX: use a keyword-aware negative lookahead so SQL keywords like
-        # JOIN/WHERE/ON are not consumed as a table alias by the optional alias group.
-        _KW = r"(?!(?:JOIN|WHERE|ON|LEFT|RIGHT|INNER|OUTER|GROUP|ORDER|HAVING|LIMIT|SELECT|FROM)\b)"
-        sql = re.sub(
-            rf"\b(FROM\s+member(?:\s+(?:AS\s+)?{_KW}\w+)?)\b",
-            r"\1 LEFT JOIN bank_details ON bank_details.member_id = member.member_id",
-            sql, flags=re.IGNORECASE, count=1,
-        )
+    # Replace legacy checks
+    sql = re.sub(r"\bbank_details\.bank_id\s+is\s+null\b", "account_no IS NULL", sql, flags=re.IGNORECASE)
+    sql = re.sub(r"\bmember\.member_id\s+is\s+null\b", "account_no IS NULL", sql, flags=re.IGNORECASE)
 
-    # ── Step 2: Normalise all bank_details JOINs to LEFT JOIN ────────────────
-    # First promote INNER JOIN → LEFT JOIN explicitly.
-    sql = re.sub(
-        r"\bINNER\s+JOIN\s+bank_details\b",
-        "LEFT JOIN bank_details",
-        sql, flags=re.IGNORECASE,
-    )
-    # Replace any remaining bare/FULL/CROSS JOIN bank_details with LEFT JOIN.
-    # Then clean up double qualifiers (e.g. "LEFT LEFT JOIN").
-    sql = re.sub(r"\bJOIN\s+bank_details\b", "LEFT JOIN bank_details", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bLEFT\s+LEFT\s+JOIN\b",  "LEFT JOIN",  sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bRIGHT\s+LEFT\s+JOIN\b", "RIGHT JOIN", sql, flags=re.IGNORECASE)
-    sql = re.sub(r"\bFULL\s+LEFT\s+JOIN\b",  "FULL JOIN",  sql, flags=re.IGNORECASE)
-
-    # ── Step 3: Add IS NULL check if missing ─────────────────────────────────
-    if "bank_details" in sql.lower() and "IS NULL" not in sql.upper():
+    if "account_no is null" not in sql.lower():
         if re.search(r"\bWHERE\b", sql, re.IGNORECASE):
             sql = re.sub(
                 r"\bWHERE\b",
-                "WHERE bank_details.bank_id IS NULL AND",
+                "WHERE account_no IS NULL AND",
                 sql, flags=re.IGNORECASE, count=1,
             )
         else:
-            # Try to insert before GROUP BY / ORDER BY / LIMIT
             injected = re.sub(
                 r"\b(GROUP\s+BY|ORDER\s+BY|LIMIT)\b",
-                r"WHERE bank_details.bank_id IS NULL \1",
+                r"WHERE account_no IS NULL \1",
                 sql, flags=re.IGNORECASE, count=1,
             )
-            if injected == sql:          # no clause found — append to end
-                sql = sql.rstrip(";") + " WHERE bank_details.bank_id IS NULL;"
+            if injected == sql:
+                sql = sql.rstrip(";") + " WHERE account_no IS NULL;"
             else:
                 sql = injected
 
-    # ── Step 4: Strip spurious member_type = 'MEM' the LLM adds ─────────────
-    if not any(w in question.lower() for w in _MEMBER_TYPE_WORDS):
-        sql = re.sub(
-            r"\s+AND\s+(?:\w+\.)?member_type\s*=\s*'MEM'",
-            "",
-            sql, flags=re.IGNORECASE,
+    return sql
+
+
+# Ordered education hierarchy (lowest → highest)
+_EDUCATION_LEVELS = [
+    "illiterate", "Literate", "5 Pass", "8 Pass",
+    "10 Pass", "12 Pass", "Graduate", "Post Graduate",
+]
+_EDUCATION_INDEX = {lvl.lower(): i for i, lvl in enumerate(_EDUCATION_LEVELS)}
+
+# Patterns that map NL fragments to their hierarchy level
+_EDU_LEVEL_KEYWORDS = [
+    (r"\bpost\s*graduate(?:s|d)?\b|\bpg\b",          "Post Graduate"),
+    (r"\bgraduate(?:s|d|ion)?\b",                      "Graduate"),
+    (r"\b12(?:th)?\s*(?:pass|class|std|standard)?\b|\bintermediate\b|\bhsc\b", "12 Pass"),
+    (r"\b10(?:th)?\s*(?:pass|class|std|standard)?\b|\bmatric\b|\bssc\b",      "10 Pass"),
+    (r"\b8(?:th)?\s*(?:pass|class|std|standard)?\b",                           "8 Pass"),
+    (r"\b5(?:th)?\s*(?:pass|class|std|standard)?\b",                           "5 Pass"),
+    (r"\bliterate\b|\bbasic\s+education\b",   "Literate"),
+    (r"\billiterate\b|\buneducated\b",         "illiterate"),
+]
+
+
+def _detect_edu_level(text: str) -> str | None:
+    """Return the canonical education level string matched in text, or None."""
+    t = text.lower()
+    for pattern, level in _EDU_LEVEL_KEYWORDS:
+        if re.search(pattern, t, re.IGNORECASE):
+            return level
+    return None
+
+
+def _fix_education_sql(sql: str, question: str) -> str:
+    """
+    Deterministically rewrite any incorrect/overly-broad education filter in LLM-generated SQL
+    into a precise IN (...) clause drawn from the ordered education hierarchy.
+
+    Handles all patterns the LLM may produce:
+      - education LIKE '%pass%' (broad, catches ALL pass levels including wrong ones)
+      - LOWER(education) LIKE '%pass%'
+      - education != 'illiterate' (wrong negative exclusion)
+      - combinations of the above with AND
+    """
+    sql_lower = sql.lower()
+
+    # Only act if the education column is referenced
+    if "education" not in sql_lower:
+        return sql
+
+    # ── Detect intended level from the question ──────────────────────────────
+    edu_level = _detect_edu_level(question)
+    q_lower = question.lower()
+    is_above = bool(re.search(r"\band\s+above\b|\bor\s+above\b|\band\s+higher\b|\bor\s+more\b", q_lower))
+    is_below = bool(re.search(r"\band\s+below\b|\bor\s+below\b|\band\s+lower\b|\bor\s+less\b", q_lower))
+
+    # ── Only fix if question signals a hierarchy range ────────────────────────
+    if not (edu_level and (is_above or is_below)):
+        # Still fix the most common LLM mistake: bare education LIKE '%pass%' without context
+        # Replace broad LIKE '%pass%' (catches wrong category) with all 4 pass levels + graduate
+        broad_like = re.search(
+            r"(?:LOWER\s*\(\s*education\s*\)|education)\s+LIKE\s+'%pass%'",
+            sql, re.IGNORECASE
         )
+        if broad_like:
+            replacement = "education IN ('5 Pass', '8 Pass', '10 Pass', '12 Pass', 'Graduate', 'Post Graduate')"
+            sql = sql[:broad_like.start()] + replacement + sql[broad_like.end():]
+            # Remove any trailing AND education != 'illiterate' guard
+            sql = re.sub(
+                r"\s+AND\s+education\s*!=\s*'illiterate'",
+                "", sql, flags=re.IGNORECASE
+            )
+        return sql
+
+    # Determine qualifying levels from hierarchy
+    level_idx = _EDUCATION_INDEX.get(edu_level.lower())
+    if level_idx is None:
+        return sql
+
+    if is_above:
+        qualifying = [_EDUCATION_LEVELS[i] for i in range(level_idx, len(_EDUCATION_LEVELS))]
+    else:  # is_below
+        qualifying = [_EDUCATION_LEVELS[i] for i in range(0, level_idx + 1)]
+
+    in_clause = "education IN (" + ", ".join(f"'{lvl}'" for lvl in qualifying) + ")"
+
+    # Replace ALL education filter patterns in the WHERE clause
+    # Pattern 1: LOWER(education) LIKE '...'
+    sql = re.sub(
+        r"LOWER\s*\(\s*education\s*\)\s+LIKE\s+'[^']*'",
+        in_clause, sql, flags=re.IGNORECASE
+    )
+    # Pattern 2: education LIKE '...'
+    sql = re.sub(
+        r"\beducation\s+LIKE\s+'[^']*'",
+        in_clause, sql, flags=re.IGNORECASE
+    )
+    # Pattern 3: education = 'SomeLevel' (exact, wrong level)
+    sql = re.sub(
+        r"\beducation\s*=\s*'[^']*'",
+        in_clause, sql, flags=re.IGNORECASE
+    )
+    # Remove any lingering AND education != 'illiterate' guard (redundant after IN clause)
+    sql = re.sub(
+        r"\s+AND\s+education\s*!=\s*'illiterate'",
+        "", sql, flags=re.IGNORECASE
+    )
+    # Collapse any duplicate in_clause if patterns matched twice
+    sql = re.sub(
+        r"(education IN \([^)]+\))\s+AND\s+\1",
+        r"\1", sql, flags=re.IGNORECASE
+    )
 
     return sql
 
@@ -734,20 +652,15 @@ def generate_sql_pipeline(
     ask_model_pull: bool = True,
     include_optimization: bool = True,
     run_query_for_profile: bool = False,
+    bypass_cache: bool = False,
 ) -> PipelineOutput:
     manager = OllamaModelManager()
     manager.ensure_model(settings.sql_model, ask_permission=ask_model_pull)
     manager.ensure_model(settings.embedding_model, ask_permission=ask_model_pull)
 
-    store = FaissSchemaStore()
-    store.build()
     normalized = normalize_query(question)
-    retrieval = SchemaRetriever(store).retrieve(normalized.normalized)
-    prompt_builder = PromptBuilder()
-    generator = OllamaSqlGenerator()
-    validator = SQLValidator()
-
-    # Fuzzy intent detection
+    
+    # Fuzzy target extraction
     from normalization.fuzzy_match import is_fuzzy_intent, extract_fuzzy_target
     is_fuzzy = is_fuzzy_intent(question)
     fuzzy_target = None
@@ -758,15 +671,129 @@ def generate_sql_pipeline(
         else:
             is_fuzzy = False
 
+    # ── Tier 0: Fast Path Check ──
+    from llm.fast_path import FastPathEngine
+    fast_engine = FastPathEngine()
+    fast_sql = fast_engine.generate_sql_fast(question)
+    if fast_sql:
+        optimization = None
+        if include_optimization and run_query_for_profile:
+            optimization = QueryOptimizer().profile(fast_sql, run_query=run_query_for_profile)
+            
+        return PipelineOutput(
+            question=question,
+            normalized_question=normalized.normalized,
+            query_corrections=normalized.corrections,
+            sql=fast_sql,
+            retrieved_tables=["citizen"],
+            retrieved_columns=["(fast_path)"],
+            confidence=1.0,
+            validation_errors=[],
+            optimization=optimization,
+            is_fuzzy=is_fuzzy,
+            fuzzy_target=fuzzy_target,
+            source="fast_path"
+        )
+
+    # ── Tier 1: Semantic Cache lookup ──
+    cached_sql = None
+    cache_store = FaissCacheStore()
+    cache = SemanticCache(cache_store)
+    if not bypass_cache:
+        cached_sql = cache.lookup(question)
+        
+        # ── Tier 1.5: AST Parameter Swapping fallback ──
+        if not cached_sql and cache_store.index is not None and len(cache_store.registry) > 0:
+            try:
+                # Embed the query to search in FAISS
+                query_vector = cache_store.embedder.embed(question).reshape(1, -1)
+                scores, indexes = cache_store.index.search(query_vector, 1)
+                if len(scores) > 0 and len(indexes) > 0:
+                    score = float(scores[0][0])
+                    idx = int(indexes[0][0])
+                    if idx >= 0 and idx < len(cache_store.registry) and score >= 0.85:
+                        matched_entry = cache_store.registry[idx]
+                        swapped_sql = fast_engine.swap_ast_parameters(
+                            matched_entry["sql"], matched_entry["question"], question
+                        )
+                        if swapped_sql:
+                            # Verify if the swapped query is valid against Whitelisted columns
+                            validator = SQLValidator()
+                            validation = validator.validate(
+                                swapped_sql,
+                                allowed_tables=["citizen"]
+                            )
+                            if validation.valid:
+                                optimization = None
+                                if include_optimization and run_query_for_profile:
+                                    optimization = QueryOptimizer().profile(swapped_sql, run_query=run_query_for_profile)
+                                return PipelineOutput(
+                                    question=question,
+                                    normalized_question=normalized.normalized,
+                                    query_corrections=normalized.corrections,
+                                    sql=swapped_sql,
+                                    retrieved_tables=["citizen"],
+                                    retrieved_columns=["(cache_swapped)"],
+                                    confidence=score,
+                                    validation_errors=[],
+                                    optimization=optimization,
+                                    is_fuzzy=is_fuzzy,
+                                    fuzzy_target=fuzzy_target,
+                                    source="cache_swapped"
+                                )
+            except Exception:
+                pass
+
+    if cached_sql:
+        # We got an exact semantic cache hit!
+        optimization = None
+        if include_optimization and run_query_for_profile:
+            optimization = QueryOptimizer().profile(cached_sql, run_query=run_query_for_profile)
+            
+        return PipelineOutput(
+            question=question,
+            normalized_question=normalized.normalized,
+            query_corrections=normalized.corrections,
+            sql=cached_sql,
+            retrieved_tables=["citizen"],
+            retrieved_columns=[],
+            confidence=1.0,
+            validation_errors=[],
+            optimization=optimization,
+            is_fuzzy=is_fuzzy,
+            fuzzy_target=fuzzy_target,
+            source="cache"
+        )
+
+    # 2. Cache Miss: Retrieve Schema Context and Dynamic Few-Shots
+    store = FaissSchemaStore()
+    store.build()
+    retrieval = SchemaRetriever(store).retrieve(normalized.normalized)
+    
+    few_shot_store = FaissFewShotStore()
+    few_shot_store.build()
+    few_shot_retriever = FewShotRetriever(few_shot_store)
+    retrieved_few_shots = few_shot_retriever.retrieve(normalized.normalized, top_k=3)
+    
+    prompt_builder = PromptBuilder()
+    generator = OllamaSqlGenerator()
+    validator = SQLValidator()
+
     previous_error: str | None = None
     sql = ""
     validation_errors: list[str] = []
     final_sql_is_valid = False
+    
     for _ in range(settings.max_retries):
-        prompt = prompt_builder.build(retrieval, previous_error=previous_error)
+        prompt = prompt_builder.build(
+            retrieval,
+            previous_error=previous_error,
+            few_shots=retrieved_few_shots
+        )
         sql = generator.generate(prompt)
         sql = _post_process_sql(sql, fuzzy_target=fuzzy_target)
-        sql = _fix_no_bank_sql(sql, question)   # handles unbanked / no-account queries
+        sql = _fix_no_bank_sql(sql, question)
+        sql = _fix_education_sql(sql, question)
         validation = validator.validate(
             sql,
             allowed_tables=retrieval.tables,
@@ -784,6 +811,10 @@ def generate_sql_pipeline(
         if validation.valid:
             optimization = QueryOptimizer().profile(sql, run_query=run_query_for_profile)
 
+    # Store successful SQL to semantic cache
+    if final_sql_is_valid and sql:
+        cache.store(question, sql)
+
     return PipelineOutput(
         question=question,
         normalized_question=normalized.normalized,
@@ -796,8 +827,8 @@ def generate_sql_pipeline(
         optimization=optimization,
         is_fuzzy=is_fuzzy,
         fuzzy_target=fuzzy_target,
+        source="llm"
     )
-
 
 
 def run_cli() -> None:
@@ -809,17 +840,26 @@ def run_cli() -> None:
     parser.add_argument("--show-results", action="store_true", help="Display up to 20 matching database rows after generating SQL.")
     parser.add_argument("--no-explain", action="store_true", help="Skip EXPLAIN query plan generation.")
     parser.add_argument("--run-profile-query", action="store_true", help="Execute the generated SQL while profiling.")
+    parser.add_argument("--clear-cache", action="store_true", help="Clear the semantic query cache.")
+    parser.add_argument("--bypass-cache", action="store_true", help="Bypass the semantic query cache.")
     args = parser.parse_args()
+
+    if args.clear_cache:
+        import os
+        cache_path = settings.data_dir / "cache.faiss"
+        metadata_path = settings.data_dir / "cache_metadata.json"
+        if cache_path.exists():
+            os.remove(cache_path)
+        if metadata_path.exists():
+            os.remove(metadata_path)
+        print("Semantic cache cleared.")
 
     if args.seed_demo_db:
         import_excel_dataset("dummy_dataset/Dummy_Data_Set.xlsx")
         print(f"Demo database ready at {settings.sqlite_path} loaded from Dummy_Data_Set.xlsx")
     if args.import_excel:
         report = import_excel_dataset(args.import_excel)
-        print(
-            f"Imported {report.members_loaded} members, {report.families_loaded} family records, "
-            f"and {report.bank_records_loaded} bank records from {report.source_name}."
-        )
+        print(f"Imported {report.rows_loaded} rows from {report.source_name}.")
 
     manager = OllamaModelManager()
     manager.ensure_model(settings.sql_model)
@@ -828,6 +868,8 @@ def run_cli() -> None:
     if args.build_index:
         FaissSchemaStore().build(force=True)
         print(f"FAISS schema index rebuilt at {settings.faiss_index_path}")
+        FaissFewShotStore().build(force=True)
+        print(f"FAISS few-shot index rebuilt at {settings.few_shot_faiss_path}")
 
     question = " ".join(args.question).strip()
     if not question:
@@ -837,6 +879,7 @@ def run_cli() -> None:
         ask_model_pull=False,
         include_optimization=not args.no_explain,
         run_query_for_profile=args.run_profile_query,
+        bypass_cache=args.bypass_cache,
     )
     print("\nGenerated SQL")
     print(output.sql)
@@ -845,6 +888,7 @@ def run_cli() -> None:
     print("\nRetrieved columns")
     print(", ".join(output.retrieved_columns))
     print(f"\nConfidence: {output.confidence}")
+    print(f"Source: {output.source.upper()}")
     if output.query_corrections:
         print("\nQuery spelling corrections")
         print(", ".join(f"{source} -> {target}" for source, target in output.query_corrections.items()))
@@ -878,19 +922,9 @@ def run_cli() -> None:
             print("\n".join(output.optimization.index_recommendations))
 
 
-def _is_streamlit() -> bool:
-    try:
-        from streamlit.runtime.scriptrunner import get_script_run_ctx
-
-        return get_script_run_ctx() is not None
-    except Exception:
-        return False
-
-
 if __name__ == "__main__":
     if _is_streamlit():
         from ui.streamlit_app import render
-
         render()
     else:
         run_cli()

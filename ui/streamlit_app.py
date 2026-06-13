@@ -6,6 +6,7 @@ from app import generate_sql_pipeline
 from database.excel_importer import import_excel_dataset
 from database.query_results import execute_select_preview
 from embeddings.faiss_store import FaissSchemaStore
+from retrieval.few_shot_retriever import FaissFewShotStore
 
 
 def render() -> None:
@@ -16,8 +17,21 @@ def render() -> None:
         st.header("Local Setup")
         auto_pull = st.checkbox("Pull missing Ollama models", value=False)
         run_profile = st.checkbox("Execute generated query for timing", value=False)
+        bypass_cache = st.checkbox("Bypass semantic query cache", value=False)
         show_results = st.checkbox("Show matching entries", value=True)
         result_limit = st.number_input("Maximum displayed rows", min_value=10, max_value=1000, value=200, step=10)
+        
+        if st.button("Clear semantic query cache"):
+            import os
+            from config.settings import settings
+            cache_path = settings.data_dir / "cache.faiss"
+            metadata_path = settings.data_dir / "cache_metadata.json"
+            if cache_path.exists():
+                os.remove(cache_path)
+            if metadata_path.exists():
+                os.remove(metadata_path)
+            st.success("Semantic query cache cleared.")
+
         if st.button("Load default dummy dataset"):
             with st.spinner("Loading records from Dummy_Data_Set.xlsx..."):
                 try:
@@ -34,11 +48,12 @@ def render() -> None:
                 except Exception as exc:
                     st.error(str(exc))
                 else:
-                    st.success(f"Loaded {report.members_loaded} citizen records.")
-        if st.button("Rebuild schema index"):
-            with st.spinner("Embedding schema metadata with Ollama and rebuilding FAISS..."):
+                    st.success(f"Loaded {report.rows_loaded} citizen records.")
+        if st.button("Rebuild schema & few-shot indices"):
+            with st.spinner("Embedding metadata with Ollama and rebuilding FAISS..."):
                 FaissSchemaStore().build(force=True)
-            st.success("Schema index rebuilt.")
+                FaissFewShotStore().build(force=True)
+            st.success("Indices rebuilt.")
 
     question = st.text_area(
         "Natural language question",
@@ -53,10 +68,47 @@ def render() -> None:
                     ask_model_pull=auto_pull,
                     include_optimization=True,
                     run_query_for_profile=run_profile,
+                    bypass_cache=bypass_cache,
                 )
             except Exception as exc:
                 st.error(str(exc))
                 return
+
+        tier_info = {
+            "fast_path": (
+                "⚡ Tier 0: Fast Path Engine",
+                "Deterministic rule-based SQL generated instantly (< 5ms) without LLM calls.",
+                "#F59E0B"
+            ),
+            "cache": (
+                "🟢 Tier 1: Exact Cache Hit",
+                "Retrieved matching SQL from semantic query cache (similarity >= 0.98).",
+                "#10B981"
+            ),
+            "cache_swapped": (
+                "🟢 Tier 1.5: Smart Cache (AST Swapped)",
+                "Retrieved structurally similar query from cache (similarity >= 0.85) and swapped parameters (gender/district/age).",
+                "#06B6D4"
+            ),
+            "llm": (
+                "🤖 Tier 2: LLM Fallback",
+                "Generated SQL using local LLM with dynamic schema context and semantic few-shots.",
+                "#8B5CF6"
+            )
+        }
+        
+        info = tier_info.get(output.source)
+        if info:
+            title, desc, border_color = info
+            st.markdown(
+                f"""
+                <div style="padding:15px; border-radius:10px; background-color:#1E293B; border-left:5px solid {border_color}; margin-bottom:20px;">
+                    <h4 style="margin:0; color:#F8FAFC; font-weight:600; font-family:'Inter', sans-serif;">{title}</h4>
+                    <p style="margin:5px 0 0 0; color:#94A3B8; font-size:14px; font-family:'Inter', sans-serif;">{desc}</p>
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
         st.subheader("Generated SQL")
         st.code(output.sql, language="sql")
@@ -120,6 +172,7 @@ def render() -> None:
                         mime="text/csv",
                     )
 
+
         if output.optimization:
             st.subheader("Execution Plan")
             st.code("\n".join(output.optimization.execution_plan))
@@ -127,3 +180,7 @@ def render() -> None:
             if output.optimization.index_recommendations:
                 st.subheader("Index Recommendations")
                 st.write(output.optimization.index_recommendations)
+
+
+if __name__ == "__main__":
+    render()

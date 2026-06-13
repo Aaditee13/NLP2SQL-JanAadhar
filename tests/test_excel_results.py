@@ -35,7 +35,6 @@ def test_import_excel_and_show_query_entries(tmp_path: Path):
                 "IFSC_CODE": "SBIN001",
                 "ACCOUNT_NO": "XXXXX123",
                 "MOBILE_NO": "XXXX123",
-                "IS_RURAL": 1,
                 "MEM_TYPE": "MEM",
                 "RELATION_WITH_HOF": "Son",
                 "CASTE": "Detailed Community",
@@ -49,15 +48,14 @@ def test_import_excel_and_show_query_entries(tmp_path: Path):
 
     report = import_excel_dataset(excel_path, database_url=database_url)
     preview = execute_select_preview(
-        "SELECT member.member_name, member.age, member.education FROM member JOIN family ON member.family_id = family.family_id "
-        "WHERE member.gender = 'Male' AND family.district = 'Jaipur';",
+        "SELECT name_en, age, education FROM citizen WHERE gender = 'Male' AND district_name_eng = 'Jaipur';",
         database_url=database_url,
     )
-    assert report.members_loaded == 1
-    assert preview.rows.to_dict(orient="records") == [{"member_name": "Ravi Kumar", "age": 25, "education": "Graduate"}]
+    assert report.rows_loaded == 1
+    assert preview.rows.to_dict(orient="records") == [{"name_en": "Ravi Kumar", "age": 25, "education": "Graduate"}]
 
 
 def test_result_preview_refuses_write_sql(tmp_path: Path):
     database_url = f"sqlite:///{(tmp_path / 'test.sqlite').as_posix()}"
     with pytest.raises(ValueError, match="unsafe SQL"):
-        execute_select_preview("DELETE FROM member;", database_url=database_url)
+        execute_select_preview("DELETE FROM citizen;", database_url=database_url)

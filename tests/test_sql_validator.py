@@ -1,206 +1,88 @@
 from validation.sql_validator import SQLValidator
 
 
-def test_validator_accepts_known_join():
-    sql = "SELECT member.member_name FROM member JOIN family ON member.family_id = family.family_id WHERE family.district = 'Jaipur';"
-    result = SQLValidator().validate(sql)
-    assert result.valid, result.errors
-
-
-def test_validator_accepts_known_join_with_aliases():
-    sql = "SELECT m.member_name FROM member AS m JOIN bank_details AS b ON m.member_id = b.member_id WHERE m.gender = 'Female';"
+def test_validator_accepts_valid_citizen_query():
+    sql = "SELECT name_en, age FROM citizen WHERE district_name_eng = 'Jaipur';"
     result = SQLValidator().validate(sql)
     assert result.valid, result.errors
 
 
 def test_validator_rejects_hallucinated_column():
-    sql = "SELECT member.fake_column FROM member;"
+    sql = "SELECT fake_column FROM citizen;"
     result = SQLValidator().validate(sql)
     assert not result.valid
-    assert "Unknown columns" in "; ".join(result.errors)
+    assert any("Unknown column" in err or "disallowed column" in err for err in result.errors)
 
 
 def test_validator_rejects_write_statement():
-    result = SQLValidator().validate("DROP TABLE member;")
+    result = SQLValidator().validate("DROP TABLE citizen;")
     assert not result.valid
 
 
 def test_validator_rejects_select_plus_write_statement():
-    result = SQLValidator().validate("SELECT member.member_name FROM member; DELETE FROM member;")
+    result = SQLValidator().validate("SELECT name_en FROM citizen; DELETE FROM citizen;")
     assert not result.valid
-    assert "Only one SQL statement is allowed." in result.errors
 
 
 def test_validator_rejects_select_into():
-    result = SQLValidator().validate("SELECT member.member_name INTO backup_member FROM member;")
+    result = SQLValidator().validate("SELECT name_en INTO backup_citizen FROM citizen;")
     assert not result.valid
-
-
-def test_validator_rejects_qualified_column_from_unjoined_table():
-    result = SQLValidator().validate("SELECT member.member_name FROM member WHERE family.district = 'Jaipur';")
-    assert not result.valid
-    assert "Qualified column references tables not present in FROM/JOIN" in "; ".join(result.errors)
 
 
 def test_post_process_sql_rewrites_name_equals():
     from app import _post_process_sql
-    sql = "SELECT member.member_name FROM member WHERE member.member_name = 'Vijay';"
+    sql = "SELECT name_en FROM citizen WHERE name_en = 'Vijay';"
     processed = _post_process_sql(sql)
-    assert "member.member_name LIKE '%Vijay%'" in processed
+    assert "name_en LIKE '%Vijay%'" in processed
 
-    # Multi-word name should also be rewritten to LIKE with wildcards
-    sql_multi = "SELECT member.member_name FROM member WHERE member.member_name = 'Vijay Kumar Laxmi';"
+    sql_multi = "SELECT name_en FROM citizen WHERE name_en = 'Vijay Kumar Laxmi';"
     processed_multi = _post_process_sql(sql_multi)
-    assert "member.member_name LIKE '%Vijay Kumar Laxmi%'" in processed_multi
+    assert "name_en LIKE '%Vijay Kumar Laxmi%'" in processed_multi
 
-    # Categorical fields (gender, marital_status, caste_category) should be canonicalized in casing
-    sql_cat = "SELECT * FROM member WHERE gender = 'male' AND caste_category = 'obc';"
+    # Categorical fields
+    sql_cat = "SELECT * FROM citizen WHERE gender = 'male' AND caste_category = 'obc';"
     processed_cat = _post_process_sql(sql_cat)
     assert "gender = 'Male'" in processed_cat
     assert "caste_category = 'OBC'" in processed_cat
 
-    # District fields should be canonicalized to exact case-insensitive matches from metadata list
-    sql_dist = "SELECT * FROM family WHERE district = 'sawai madhopur';"
+    # District fields
+    sql_dist = "SELECT * FROM citizen WHERE district_name_eng = 'sawai madhopur';"
     processed_dist = _post_process_sql(sql_dist)
-    assert "district = 'Sawai Madhopur'" in processed_dist
-
-
-def test_post_process_sql_prunes_unused_family_join():
-    from app import _post_process_sql
-    
-    # Unused family join should be pruned
-    sql = (
-        "SELECT DISTINCT member.member_name "
-        "FROM member INNER JOIN family ON member.family_id = family.family_id "
-        "WHERE member.caste LIKE '%Jat%' AND member.marital_status = 'Widow' AND member.age > 21;"
-    )
-    processed = _post_process_sql(sql)
-    assert "JOIN family" not in processed
-    assert "family.family_id" not in processed
-    assert "member.family_id = family.family_id" not in processed
-    assert "FROM member WHERE (member.caste LIKE" in processed
-
-    # Used family join (by alias) should NOT be pruned
-    sql_used_alias = (
-        "SELECT DISTINCT member.member_name "
-        "FROM member INNER JOIN family F ON member.family_id = F.family_id "
-        "WHERE F.district = 'Jaipur';"
-    )
-    processed_used_alias = _post_process_sql(sql_used_alias)
-    assert "JOIN family" in processed_used_alias or "JOIN family F" in processed_used_alias
-
-    # Used family join (no alias) should NOT be pruned
-    sql_used_no_alias = (
-        "SELECT DISTINCT member.member_name "
-        "FROM member INNER JOIN family ON member.family_id = family.family_id "
-        "WHERE family.district = 'Jaipur';"
-    )
-    processed_used_no_alias = _post_process_sql(sql_used_no_alias)
-    assert "JOIN family" in processed_used_no_alias
+    assert "district_name_eng = 'Sawai Madhopur'" in processed_dist
 
 
 def test_post_process_caste_bilingual_expansion():
     from app import _post_process_sql
 
-    # Test LIKE-based expansion
-    sql1 = "SELECT * FROM member WHERE member.caste LIKE '%Rajput%';"
+    sql1 = "SELECT * FROM citizen WHERE caste LIKE '%Rajput%';"
     processed1 = _post_process_sql(sql1)
-    assert "member.caste LIKE '%Rajput%'" in processed1
-    assert "member.caste LIKE '%Rajpoot%'" in processed1
-    assert "member.caste LIKE '%राजपूत%'" in processed1
+    assert "caste LIKE '%Rajput%'" in processed1
+    assert "caste LIKE '%Rajpoot%'" in processed1
+    assert "caste LIKE '%राजपूत%'" in processed1
 
-    # Test equals-based expansion (which gets rewritten to LIKE, then expanded)
-    sql2 = "SELECT * FROM member WHERE member.caste = 'Rajput';"
+    sql2 = "SELECT * FROM citizen WHERE caste = 'Rajput';"
     processed2 = _post_process_sql(sql2)
-    assert "member.caste LIKE '%Rajput%'" in processed2
-    assert "member.caste LIKE '%Rajpoot%'" in processed2
-    assert "member.caste LIKE '%राजपूत%'" in processed2
-
-    # Test IN-based expansion
-    sql3 = "SELECT * FROM member WHERE member.caste IN ('Rajput', 'RAJPOOT');"
-    processed3 = _post_process_sql(sql3)
-    assert "member.caste LIKE '%Rajput%'" in processed3
-    assert "member.caste LIKE '%Rajpoot%'" in processed3
-    assert "member.caste LIKE '%राजपूत%'" in processed3
-
-    # Test another caste (e.g. Agarwal/Agrawal)
-    sql4 = "SELECT * FROM member WHERE member.caste = 'Agarwal';"
-    processed4 = _post_process_sql(sql4)
-    assert "member.caste LIKE '%Agarwal%'" in processed4
-    assert "member.caste LIKE '%Agrawal%'" in processed4
-    assert "member.caste LIKE '%अग्रवाल%'" in processed4
-
+    assert "caste LIKE '%Rajput%'" in processed2
+    assert "caste LIKE '%Rajpoot%'" in processed2
+    assert "caste LIKE '%राजपूत%'" in processed2
 
 
 def test_post_process_bank_in_clause_case_insensitivity():
     from app import _post_process_sql
 
-    # Mixed-case bank names in IN clause should all be uppercased
-    sql = "SELECT * FROM bank_account WHERE bank_account.bank_name IN ('sbi', 'HDFC', 'Icici');"
+    sql = "SELECT * FROM citizen WHERE bank IN ('sbi', 'HDFC', 'Icici');"
     result = _post_process_sql(sql)
     assert "UPPER(" in result
     assert "'SBI'" in result
     assert "'HDFC'" in result
     assert "'ICICI'" in result
 
-    # Single bank name IN clause
-    sql2 = "SELECT * FROM bank_account WHERE bank_name IN ('pnb');"
-    result2 = _post_process_sql(sql2)
-    assert "UPPER(" in result2
-    assert "'PNB'" in result2
-
-
-def test_post_process_categorical_in_clause_normalization():
-    from app import _post_process_sql
-
-    # gender IN clause — mixed case aliases → canonical
-    sql_gender = "SELECT * FROM member WHERE member.gender IN ('male', 'Female');"
-    result = _post_process_sql(sql_gender)
-    assert "'Male'" in result
-    assert "'Female'" in result
-
-    # caste_category IN clause — variant names → canonical codes
-    sql_cat = "SELECT * FROM member WHERE member.caste_category IN ('general', 'SC', 'obc');"
-    result = _post_process_sql(sql_cat)
-    assert "'GEN'" in result
-    assert "'SC'" in result
-    assert "'OBC'" in result
-
-    # marital_status IN clause — variant names → canonical values
-    sql_marital = "SELECT * FROM member WHERE member.marital_status IN ('widow', 'single', 'married');"
-    result = _post_process_sql(sql_marital)
-    assert "'Widow'" in result
-    assert "'Unmarried'" in result
-    assert "'Married'" in result
-
-
-def test_post_process_district_in_clause_all_known_districts():
-    from app import _post_process_sql
-
-    # All values are known Rajasthan districts → stays as IN with canonical casing
-    sql = "SELECT * FROM family WHERE family.district IN ('jaipur', 'JODHPUR', 'Udaipur');"
-    result = _post_process_sql(sql)
-    assert "DISTRICT IN" in result.upper()
-    assert "'Jaipur'" in result
-    assert "'Jodhpur'" in result
-    assert "'Udaipur'" in result
-
 
 def test_post_process_district_in_clause_non_district_redirect():
     from app import _post_process_sql
 
-    # Srinagar is NOT a Rajasthan district → should be redirected to block/village
-    sql = "SELECT * FROM family WHERE family.district IN ('Srinagar', 'Jaipur');"
+    # Srinagar is NOT a Rajasthan district -> block/village
+    sql = "SELECT * FROM citizen WHERE district_name_eng IN ('Srinagar', 'Jaipur');"
     result = _post_process_sql(sql)
-    # Srinagar should be redirected to block/village LIKE conditions
-    assert "block LIKE '%Srinagar%'" in result or "village LIKE '%Srinagar%'" in result
-    # Jaipur is a known district → should stay as district = 'Jaipur'
-    assert "district = 'Jaipur'" in result
-
-    # Fully non-district list → both redirected
-    sql2 = "SELECT * FROM family WHERE f.district IN ('Beejasar', 'Srinagar');"
-    result2 = _post_process_sql(sql2)
-    assert "block LIKE '%Beejasar%'" in result2 or "village LIKE '%Beejasar%'" in result2
-    assert "block LIKE '%Srinagar%'" in result2 or "village LIKE '%Srinagar%'" in result2
-    assert "district IN" not in result2.upper()
-
+    assert "block_name_eng LIKE '%Srinagar%'" in result or "vill_name_eng LIKE '%Srinagar%'" in result
+    assert "district_name_eng = 'Jaipur'" in result

@@ -73,7 +73,10 @@ def fuzzy_rerank(
         return df
 
     # Detect name column
-    name_cols = ["member_name", "father_name", "mother_name", "spouse_name", "family_head_name"]
+    name_cols = [
+        "name_en", "father_name_en", "mother_name_en", "spouce_name_en",
+        "member_name", "father_name", "mother_name", "spouse_name", "family_head_name"
+    ]
     df_cols_lower = {col.lower(): col for col in df.columns}
 
     match_col = None

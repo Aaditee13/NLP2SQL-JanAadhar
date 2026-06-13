@@ -17,6 +17,9 @@ class Settings:
     data_dir: Path = PROJECT_ROOT / "data"
     faiss_index_path: Path = PROJECT_ROOT / "data" / "schema.faiss"
     faiss_metadata_path: Path = PROJECT_ROOT / "data" / "schema_metadata.json"
+    few_shot_json_path: Path = PROJECT_ROOT / "prompting" / "few_shots.json"
+    few_shot_faiss_path: Path = PROJECT_ROOT / "data" / "few_shot.faiss"
+    few_shot_metadata_path: Path = PROJECT_ROOT / "data" / "few_shot_metadata.json"
     sqlite_path: Path = PROJECT_ROOT / "data" / "jan_aadhaar_demo.sqlite"
     max_retries: int = int(os.getenv("MAX_SQL_RETRIES", "3"))
     retrieval_top_k: int = int(os.getenv("RETRIEVAL_TOP_K", "16"))

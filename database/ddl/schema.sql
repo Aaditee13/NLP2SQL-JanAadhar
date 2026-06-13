@@ -1,56 +1,35 @@
-CREATE TABLE family (
-    family_id INTEGER PRIMARY KEY,
-    jan_aadhaar_number VARCHAR(20) UNIQUE NOT NULL,
-    family_head_name VARCHAR(120) NOT NULL,
-    permanent_address TEXT,
-    current_address TEXT,
-    district VARCHAR(80) NOT NULL,
-    city VARCHAR(80),
-    block VARCHAR(80),
-    gram_panchayat VARCHAR(100),
-    village VARCHAR(100),
-    ward VARCHAR(40),
-    ration_card_number VARCHAR(40),
-    is_rural BOOLEAN
-);
-
-CREATE TABLE member (
+CREATE TABLE citizen (
     member_id INTEGER PRIMARY KEY,
-    family_id INTEGER NOT NULL REFERENCES family(family_id),
-    jan_aadhaar_member_id VARCHAR(24) UNIQUE NOT NULL,
-    member_name VARCHAR(120) NOT NULL,
-    father_name VARCHAR(120),
-    mother_name VARCHAR(120),
-    spouse_name VARCHAR(120),
-    date_of_birth DATE,
+    enrollment_id VARCHAR(20) NOT NULL,
+    district_name_eng VARCHAR(80) NOT NULL,
+    is_rural INTEGER,
+    block_name_eng VARCHAR(80),
+    city_name_eng VARCHAR(80),
+    ward_name_eng VARCHAR(40),
+    gp_name_eng VARCHAR(100),
+    vill_name_eng VARCHAR(100),
+    mem_type VARCHAR(20),
+    relation_with_hof VARCHAR(40),
+    name_en VARCHAR(120) NOT NULL,
+    father_name_en VARCHAR(120),
+    mother_name_en VARCHAR(120),
+    marital_status VARCHAR(32),
+    spouce_name_en VARCHAR(120),
+    dob DATE,
     age INTEGER,
     gender VARCHAR(16) NOT NULL,
-    mobile_number VARCHAR(16),
-    email VARCHAR(120),
-    photo_path VARCHAR(255),
-    aadhaar_masked VARCHAR(20),
-    voter_id VARCHAR(30),
-    pan_number VARCHAR(20),
     caste_category VARCHAR(32),
-    religion VARCHAR(40),
-    marital_status VARCHAR(32),
-    disability_status BOOLEAN DEFAULT 0,
-    member_type VARCHAR(20),
-    relation_with_hof VARCHAR(40),
     caste VARCHAR(180),
+    bank VARCHAR(120),
+    ifsc_code VARCHAR(16),
+    account_no VARCHAR(32),
+    mobile_no VARCHAR(16),
     income INTEGER,
     occupation VARCHAR(80),
     minority VARCHAR(40),
     education VARCHAR(80)
 );
 
-CREATE TABLE bank_details (
-    bank_id INTEGER PRIMARY KEY,
-    member_id INTEGER NOT NULL REFERENCES member(member_id),
-    bank_account VARCHAR(32) NOT NULL,
-    bank_name VARCHAR(120) NOT NULL,
-    ifsc_code VARCHAR(16) NOT NULL,
-    dbt_status VARCHAR(24) NOT NULL
-);
-CREATE INDEX ix_family_geo ON family(district, block, gram_panchayat, village);
-CREATE INDEX ix_member_gender_caste_age ON member(gender, caste_category, age);
+CREATE INDEX ix_citizen_geo ON citizen(district_name_eng, block_name_eng, gp_name_eng, vill_name_eng);
+CREATE INDEX ix_citizen_demographics ON citizen(gender, caste_category, age);
+CREATE INDEX ix_citizen_enrollment ON citizen(enrollment_id);

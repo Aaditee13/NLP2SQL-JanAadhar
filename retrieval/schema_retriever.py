@@ -8,21 +8,16 @@ from database.schema_metadata import COLUMNS, RAJASTHAN_DISTRICTS_41, RELATIONSH
 from embeddings.faiss_store import FaissSchemaStore
 
 
-# Terms that signal the user wants the detailed caste name (member.caste)
 CASTE_DETAIL_TERMS = {"caste", "community", "jati"}
-# Terms that signal the user wants the caste category SC/ST/OBC/GEN (member.caste_category)
 CASTE_CATEGORY_TERMS = {"category", "sc", "st", "obc", "general", "gen", "scheduled",
                         "backward", "forward", "unreserved", "open category"}
-# Combined for backward-compat where either column is relevant
 CASTE_TERMS = CASTE_DETAIL_TERMS | CASTE_CATEGORY_TERMS
 
 WELFARE_TERMS = {"beneficiary", "beneficiaries"}
 BANK_TERMS = {
     "bank", "account", "ifsc", "dbt", "payment",
-    # Common bank abbreviations used in queries
     "sbi", "pnb", "bob", "hdfc", "icici", "uco", "canara", "baroda",
     "gramin", "cooperative", "union bank", "central bank", "indian bank",
-    # Unbanked / no-bank-account query terms
     "unbanked", "no bank", "without bank", "no account", "without account",
 }
 IDENTITY_TERMS = {"aadhaar", "jan", "voter", "pan", "identity", "id", "mobile", "phone", "email", "photo"}
@@ -31,6 +26,15 @@ RELIGION_TERMS = {"religion", "faith"}
 MINORITY_TERMS = {"minority", "muslim", "muslims", "jain", "jains"}
 EDUCATION_TERMS = {"education", "qualification", "illiterate", "literate", "graduate", "school", "pass", "matric", "intermediate"}
 RURAL_TERMS = {"rural", "urban", "city dweller", "village people", "village families", "city families"}
+GENDER_TERMS = {
+    "gender", "sex", "male", "female", "man", "woman", "boy", "girl",
+    "boys", "girls", "men", "women", "lady", "ladies", "gent", "gents", "widow", "widows"
+}
+AGE_TERMS = {
+    "age", "year", "years", "old", "young", "adult", "minor", "senior",
+    "elderly", "child", "children", "born", "dob", "birth", "date",
+    "above", "below", "older", "younger", "between", "under", "over"
+}
 
 KNOWN_CASTES = {
     "jat", "arai", "fakir", "mina", "ramgadiya", "rajput", "rajpoot", "moyla", 
@@ -89,16 +93,11 @@ class SchemaRetriever:
 
     def retrieve(self, question: str, top_k: int = settings.retrieval_top_k) -> RetrievalResult:
         docs = self.store.search(question, top_k=top_k)
-        tables: set[str] = set()
+        tables: set[str] = {"citizen"}
         columns: set[str] = set()
         question_lower = question.lower()
         question_terms = _terms(question_lower)
         lexical_columns: set[str] = set()
-        semantic_columns: set[str] = set()
-
-        for table in TABLES:
-            if _matches(table.table, question_lower, question_terms) or any(_matches(alias, question_lower, question_terms) for alias in table.aliases):
-                tables.add(table.table)
 
         for column in COLUMNS:
             lexical_terms = [column.column.replace("_", " "), *column.aliases, *column.sample_values]
@@ -108,7 +107,7 @@ class SchemaRetriever:
         # Add lexical columns first
         columns.update(lexical_columns)
 
-        # Add top semantic columns that are not already present, up to a limit of 6
+        # Add top semantic columns that are not already present, up to a limit of 8
         semantic_added = 0
         for doc in docs:
             if doc.get("kind") != "column" or not doc.get("qualified_name"):
@@ -119,7 +118,7 @@ class SchemaRetriever:
             if _column_allowed_by_domain(qualified_name, question_lower, question_terms):
                 columns.add(qualified_name)
                 semantic_added += 1
-            if semantic_added >= 6:
+            if semantic_added >= 8:
                 break
 
         non_district_loc = False
@@ -129,58 +128,33 @@ class SchemaRetriever:
                 non_district_loc = True
 
         if (GEOGRAPHY_TERMS & question_terms) or _mentions_possible_location(question_lower):
-            tables.add("family")
-            columns.add("family.family_id")
-            columns.add("family.district")
+            columns.add("citizen.district_name_eng")
             if {"block", "tehsil", "kotputli"} & question_terms or non_district_loc:
-                columns.add("family.block")
+                columns.add("citizen.block_name_eng")
             if "village" in question_lower or non_district_loc:
-                columns.add("family.village")
+                columns.add("citizen.vill_name_eng")
 
-        # is_rural: include when question mentions rural/urban classification
+        # is_rural
         if RURAL_TERMS & question_terms or any(t in question_lower for t in ("rural", "urban", "is_rural")):
-            tables.add("family")
-            columns.add("family.is_rural")
+            columns.add("citizen.is_rural")
 
-        # Force retrieve member.caste if query contains any known caste terms
+        # Force retrieve caste if query contains any known caste terms
         if (KNOWN_CASTES & question_terms) or any(caste in question_lower for caste in KNOWN_CASTES):
-            columns.add("member.caste")
+            columns.add("citizen.caste")
 
-        tables.update(column.split(".")[0] for column in columns)
-
-        # Include join keys and display fields for tables already selected, without broadening the prompt too much.
-        for relationship in RELATIONSHIPS:
-            if relationship["from_table"] in tables and relationship["to_table"] in tables:
-                columns.add(f'{relationship["from_table"]}.{relationship["from_column"]}')
-                columns.add(f'{relationship["to_table"]}.{relationship["to_column"]}')
-
-        if any(token in question.lower() for token in [
-            "show", "list", "display", "beneficiary", "all",
-            # Person-listing signals: 'who' and imperative fetch verbs.
-            # 'has'/'members'/'families'/'most' are intentionally excluded
-            # because they fire on aggregate queries (COUNT/SUM/AVG) where
-            # adding member_name to context causes the LLM to mix SELECT
-            # columns with aggregates, producing invalid SQL.
-            "who", "find", "fetch", "get",
-        ]):
-            for candidate in ["member.member_name", "family.jan_aadhaar_number"]:
-                table, column = candidate.split(".")
-                if table in tables and any(c.table == table and c.column == column for c in COLUMNS):
-                    columns.add(candidate)
+        # Display fields automatically added on list queries
+        if any(token in question.lower() for token in ["show", "list", "display", "beneficiary", "all", "who", "find", "fetch", "get"]):
+            columns.add("citizen.name_en")
+            columns.add("citizen.enrollment_id")
 
         columns = _prune_columns(columns, question_lower, question_terms)
-        tables = {column.split(".")[0] for column in columns}
-        relationships = [
-            relationship
-            for relationship in RELATIONSHIPS
-            if relationship["from_table"] in tables and relationship["to_table"] in tables
-        ]
+        
         confidence = sum(doc["score"] for doc in docs[: min(5, len(docs))]) / max(1, min(5, len(docs)))
         return RetrievalResult(
             question=question,
-            tables=sorted(tables),
+            tables=["citizen"],
             columns=sorted(columns),
-            relationships=relationships,
+            relationships=[],
             documents=docs,
             confidence=round(confidence, 4),
         )
@@ -188,7 +162,6 @@ class SchemaRetriever:
 
 def _terms(text: str) -> set[str]:
     import re
-
     return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
 
 
@@ -202,18 +175,21 @@ def _matches(term: str, question_lower: str, question_terms: set[str]) -> bool:
 
 
 def _column_allowed_by_domain(qualified_name: str, question_lower: str, question_terms: set[str]) -> bool:
-    table, column = qualified_name.split(".")
-    # bank_details: only include when question mentions banking/payment terms
-    if table == "bank_details" and not (BANK_TERMS & question_terms):
+    _, column = qualified_name.split(".")
+    
+    # bank mapping
+    if column in ("bank", "account_no", "ifsc_code") and not (BANK_TERMS & question_terms):
         return False
-    # caste_category (SC/ST/OBC/GEN) only when user explicitly mentions a category term
-    # NOTE: the word 'caste' alone should NOT trigger caste_category retrieval —
-    # it only means the user wants the caste name (member.caste).
-    if qualified_name == "member.caste_category" and not (CASTE_CATEGORY_TERMS & question_terms):
+    # caste_category mapping
+    if column == "caste_category" and not (CASTE_CATEGORY_TERMS & question_terms):
         return False
-    if qualified_name == "member.minority" and not (MINORITY_TERMS & question_terms):
+    if column == "minority" and not (MINORITY_TERMS & question_terms):
         return False
-    if qualified_name == "member.education" and not (EDUCATION_TERMS & question_terms):
+    if column == "education" and not (EDUCATION_TERMS & question_terms):
+        return False
+    if column == "gender" and not (GENDER_TERMS & question_terms):
+        return False
+    if column in ("age", "dob") and not (AGE_TERMS & question_terms):
         return False
     return True
 
@@ -229,31 +205,28 @@ def _prune_columns(columns: set[str], question_lower: str, question_terms: set[s
             non_district_loc = True
 
     for qualified_name in columns:
-        table, column = qualified_name.split(".")
+        _, column = qualified_name.split(".")
         if not _column_allowed_by_domain(qualified_name, question_lower, question_terms):
             continue
-        if table == "bank_details" and not (BANK_TERMS & question_terms or any(term in question_lower for term in BANK_TERMS)):
+        if column in ("bank", "account_no", "ifsc_code") and not (BANK_TERMS & question_terms or any(term in question_lower for term in BANK_TERMS)):
             continue
-        if qualified_name in {
-            "member.jan_aadhaar_member_id",
-            "member.mobile_number",
-        } and not (IDENTITY_TERMS & question_terms or any(term in question_lower for term in IDENTITY_TERMS)):
+        if column in ("jan_aadhaar_member_id", "mobile_no") and not (IDENTITY_TERMS & question_terms or any(term in question_lower for term in IDENTITY_TERMS)):
             continue
-        if qualified_name in {"family.jan_aadhaar_number"} and not ((IDENTITY_TERMS | WELFARE_TERMS) & question_terms or any(term in question_lower for term in (IDENTITY_TERMS | WELFARE_TERMS))):
+        if column in ("enrollment_id") and not ((IDENTITY_TERMS | WELFARE_TERMS) & question_terms or any(term in question_lower for term in (IDENTITY_TERMS | WELFARE_TERMS))):
             continue
-        if qualified_name == "family.block" and not ({"block", "tehsil", "kotputli"} & question_terms or "block" in question_lower or "tehsil" in question_lower or "kotputli" in question_lower or non_district_loc):
+        if column == "block_name_eng" and not ({"block", "tehsil", "kotputli"} & question_terms or "block" in question_lower or "tehsil" in question_lower or "kotputli" in question_lower or non_district_loc):
             continue
-        if qualified_name == "family.gram_panchayat" and not ({"gram", "panchayat", "gp"} & question_terms or "gram" in question_lower or "panchayat" in question_lower or "gp" in question_lower):
+        if column == "gp_name_eng" and not ({"gram", "panchayat", "gp"} & question_terms or "gram" in question_lower or "panchayat" in question_lower or "gp" in question_lower):
             continue
-        if qualified_name == "family.village" and not ("village" in question_terms or "village" in question_lower or non_district_loc):
+        if column == "vill_name_eng" and not ("village" in question_terms or "village" in question_lower or non_district_loc):
             continue
-        if qualified_name == "family.ward" and not ("ward" in question_terms or "ward" in question_lower):
+        if column == "ward_name_eng" and not ("ward" in question_terms or "ward" in question_lower):
             continue
-        if qualified_name == "family.city" and not ({"city", "town", "urban"} & question_terms or "city" in question_lower or "town" in question_lower or "urban" in question_lower):
+        if column == "city_name_eng" and not ({"city", "town", "urban"} & question_terms or "city" in question_lower or "town" in question_lower or "urban" in question_lower):
             continue
-        if qualified_name == "family.district" and not ((DISTRICT_TERMS | GEOGRAPHY_TERMS) & question_terms or any(term in question_lower for term in (DISTRICT_TERMS | GEOGRAPHY_TERMS)) or possible_location):
+        if column == "district_name_eng" and not ((DISTRICT_TERMS | GEOGRAPHY_TERMS) & question_terms or any(term in question_lower for term in (DISTRICT_TERMS | GEOGRAPHY_TERMS)) or possible_location):
             continue
-        if qualified_name == "family.is_rural" and not (RURAL_TERMS & question_terms or any(t in question_lower for t in ("rural", "urban", "is_rural"))):
+        if column == "is_rural" and not (RURAL_TERMS & question_terms or any(t in question_lower for t in ("rural", "urban", "is_rural"))):
             continue
         pruned.add(qualified_name)
     return pruned
@@ -261,7 +234,6 @@ def _prune_columns(columns: set[str], question_lower: str, question_terms: set[s
 
 def _mentions_possible_location(question_lower: str) -> bool:
     import re
-
     for preposition in LOCATION_PREPOSITIONS:
         match = re.search(rf"\b{preposition}\s+([a-zA-Z][a-zA-Z-]*)\b", question_lower)
         if not match:

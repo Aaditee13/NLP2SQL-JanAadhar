@@ -1,0 +1,54 @@
+[
+  {
+    "question": "Show all males in Jaipur",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE gender = 'Male' AND district_name_eng = 'Jaipur' LIMIT 200;"
+  },
+  {
+    "question": "Count of SC widows above 50",
+    "sql": "SELECT COUNT(*) AS count FROM citizen WHERE caste_category = 'SC' AND marital_status = 'Widow' AND age > 50;"
+  },
+  {
+    "question": "Farmers in rural Bikaner",
+    "sql": "SELECT name_en, age, occupation, vill_name_eng FROM citizen WHERE occupation LIKE '%Farmer%' AND district_name_eng = 'Bikaner' AND is_rural = 1 LIMIT 200;"
+  },
+  {
+    "question": "Members without a bank account",
+    "sql": "SELECT name_en, district_name_eng, age FROM citizen WHERE account_no IS NULL LIMIT 200;"
+  },
+  {
+    "question": "Show details of students in Jodhpur",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE occupation LIKE '%Student%' AND district_name_eng = 'Jodhpur' LIMIT 200;"
+  },
+  {
+    "question": "Average income of OBC citizens in Jodhpur",
+    "sql": "SELECT AVG(income) AS avg_income FROM citizen WHERE caste_category = 'OBC' AND district_name_eng = 'Jodhpur';"
+  },
+  {
+    "question": "How many children (below 18) in each district",
+    "sql": "SELECT district_name_eng, COUNT(*) AS child_count FROM citizen WHERE age < 18 GROUP BY district_name_eng ORDER BY child_count DESC;"
+  },
+  {
+    "question": "Members of families that have at least one doctor",
+    "sql": "SELECT name_en, district_name_eng, age FROM citizen WHERE enrollment_id IN (SELECT enrollment_id FROM citizen WHERE occupation LIKE '%Doctor%') LIMIT 200;"
+  },
+  {
+    "question": "Show data of all Jat whose sons have account in SBI",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE caste LIKE '%Jat%' AND enrollment_id IN (SELECT enrollment_id FROM citizen WHERE relation_with_hof = 'Son' AND bank LIKE '%SBI%') LIMIT 200;"
+  },
+  {
+    "question": "Unemployed citizens in urban Jaipur",
+    "sql": "SELECT name_en, age, occupation, city_name_eng FROM citizen WHERE occupation LIKE '%Unemployed%' AND district_name_eng = 'Jaipur' AND is_rural = 0 LIMIT 200;"
+  },
+  {
+    "question": "Families with more than 3 members",
+    "sql": "SELECT enrollment_id, COUNT(*) AS member_count FROM citizen GROUP BY enrollment_id HAVING COUNT(*) > 3;"
+  },
+  {
+    "question": "Show members of families where HOF is illiterate",
+    "sql": "SELECT name_en, age, relation_with_hof FROM citizen WHERE enrollment_id IN (SELECT enrollment_id FROM citizen WHERE mem_type = 'HOF' AND LOWER(education) = 'illiterate') LIMIT 200;"
+  },
+  {
+    "question": "Total income of families in Bikaner",
+    "sql": "SELECT enrollment_id, SUM(income) AS total_family_income FROM citizen WHERE district_name_eng = 'Bikaner' GROUP BY enrollment_id LIMIT 200;"
+  }
+]
