@@ -1,11 +1,16 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from typing import Any
 
 from config.settings import settings
 from database.schema_metadata import COLUMNS, RAJASTHAN_DISTRICTS_41, RELATIONSHIPS, TABLES
 from embeddings.faiss_store import FaissSchemaStore
+
+
+# Pre-compiled regex for _terms() — defined before constants that use it
+_ALPHANUM_RE = re.compile(r"[a-zA-Z0-9]+")
 
 
 CASTE_DETAIL_TERMS = {"caste", "community", "jati"}
@@ -76,6 +81,13 @@ LOCATION_STOPWORDS = {
     "pending",
 }
 
+# Pre-compiled patterns that reference the constants defined above
+_LOC_PREPOSITION_PATTERN = re.compile(
+    r"\b(?:" + "|".join(sorted(LOCATION_PREPOSITIONS)) + r")\s+([a-zA-Z][a-zA-Z-]*)\b"
+)
+_LIST_TOKENS = ["show", "list", "display", "beneficiary", "all", "who", "find", "fetch", "get"]
+_LIST_TOKEN_PATTERN = re.compile(r"\b(?:" + "|".join(_LIST_TOKENS) + r")\b")
+
 
 @dataclass
 class RetrievalResult:
@@ -121,13 +133,16 @@ class SchemaRetriever:
             if semantic_added >= 8:
                 break
 
+        # Pre-compute possible_location and non_district_loc once here;
+        # pass them into _prune_columns to avoid recomputing.
+        possible_location = _mentions_possible_location(question_lower)
         non_district_loc = False
-        if _mentions_possible_location(question_lower):
+        if possible_location:
             known_districts = {d.lower() for d in RAJASTHAN_DISTRICTS_41}
             if not (question_terms & known_districts):
                 non_district_loc = True
 
-        if (GEOGRAPHY_TERMS & question_terms) or _mentions_possible_location(question_lower):
+        if (GEOGRAPHY_TERMS & question_terms) or possible_location:
             columns.add("citizen.district_name_eng")
             if {"block", "tehsil", "kotputli"} & question_terms or non_district_loc:
                 columns.add("citizen.block_name_eng")
@@ -143,13 +158,18 @@ class SchemaRetriever:
             columns.add("citizen.caste")
 
         # Display fields automatically added on list queries
-        if any(token in question.lower() for token in ["show", "list", "display", "beneficiary", "all", "who", "find", "fetch", "get"]):
+        if _LIST_TOKEN_PATTERN.search(question_lower):
             columns.add("citizen.name_en")
             columns.add("citizen.enrollment_id")
 
-        columns = _prune_columns(columns, question_lower, question_terms)
-        
+        columns = _prune_columns(
+            columns, question_lower, question_terms,
+            possible_location=possible_location,
+            non_district_loc=non_district_loc,
+        )
+
         confidence = sum(doc["score"] for doc in docs[: min(5, len(docs))]) / max(1, min(5, len(docs)))
+
         return RetrievalResult(
             question=question,
             tables=["citizen"],
@@ -161,8 +181,7 @@ class SchemaRetriever:
 
 
 def _terms(text: str) -> set[str]:
-    import re
-    return set(re.findall(r"[a-zA-Z0-9]+", text.lower()))
+    return set(_ALPHANUM_RE.findall(text.lower()))
 
 
 def _matches(term: str, question_lower: str, question_terms: set[str]) -> bool:
@@ -194,15 +213,23 @@ def _column_allowed_by_domain(qualified_name: str, question_lower: str, question
     return True
 
 
-def _prune_columns(columns: set[str], question_lower: str, question_terms: set[str]) -> set[str]:
+def _prune_columns(
+    columns: set[str],
+    question_lower: str,
+    question_terms: set[str],
+    possible_location: bool | None = None,
+    non_district_loc: bool | None = None,
+) -> set[str]:
     pruned: set[str] = set()
-    possible_location = _mentions_possible_location(question_lower)
-
-    non_district_loc = False
-    if possible_location:
-        known_districts = {d.lower() for d in RAJASTHAN_DISTRICTS_41}
-        if not (question_terms & known_districts):
-            non_district_loc = True
+    # Reuse caller-computed values when available to avoid redundant work
+    if possible_location is None:
+        possible_location = _mentions_possible_location(question_lower)
+    if non_district_loc is None:
+        non_district_loc = False
+        if possible_location:
+            known_districts = {d.lower() for d in RAJASTHAN_DISTRICTS_41}
+            if not (question_terms & known_districts):
+                non_district_loc = True
 
     for qualified_name in columns:
         _, column = qualified_name.split(".")
@@ -233,11 +260,7 @@ def _prune_columns(columns: set[str], question_lower: str, question_terms: set[s
 
 
 def _mentions_possible_location(question_lower: str) -> bool:
-    import re
-    for preposition in LOCATION_PREPOSITIONS:
-        match = re.search(rf"\b{preposition}\s+([a-zA-Z][a-zA-Z-]*)\b", question_lower)
-        if not match:
-            continue
+    for match in _LOC_PREPOSITION_PATTERN.finditer(question_lower):
         candidate = match.group(1).lower()
         if candidate not in LOCATION_STOPWORDS and not candidate.isdigit():
             return True

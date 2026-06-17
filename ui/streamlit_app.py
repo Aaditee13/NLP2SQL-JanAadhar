@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import streamlit as st
 
-from app import generate_sql_pipeline
+from app import generate_sql_pipeline, invalidate_cache_singleton
 from database.excel_importer import import_excel_dataset
 from database.query_results import execute_select_preview
 from embeddings.faiss_store import FaissSchemaStore
@@ -30,6 +30,8 @@ def render() -> None:
                 os.remove(cache_path)
             if metadata_path.exists():
                 os.remove(metadata_path)
+            # Also reset the in-memory singleton so the next query starts fresh
+            invalidate_cache_singleton()
             st.success("Semantic query cache cleared.")
 
         if st.button("Load default dummy dataset"):

@@ -14,9 +14,9 @@ _GENDER_MAP = {
 }
 
 _MARITAL_MAP = {
-    r"\bmarried\b": "Married",
-    r"\bunmarried\b|\bsingle\b|\bbachelor\b": "Unmarried",
-    r"\bwidow(?:s|ed|er|ers)?\b": "Widow",
+    re.compile(r"\bmarried\b"): "Married",
+    re.compile(r"\bunmarried\b|\bsingle\b|\bbachelor\b"): "Unmarried",
+    re.compile(r"\bwidow(?:s|ed|er|ers)?\b"): "Widow",
 }
 
 _CASTE_CAT_MAP = {
@@ -106,6 +106,21 @@ _COMPLEX_KEYWORDS = {
     "how many", "ratio", "percentage", "rank", "top", "most",
     "least", "across", "compare", "except", "not in",
 }
+# Single compiled regex for all complex keywords — avoids re.escape + re.search
+# being called in a tight loop for every keyword on every query.
+_COMPLEX_KW_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(kw) for kw in _COMPLEX_KEYWORDS) + r")\b"
+)
+
+# Pre-compile age and income patterns (replace string with compiled object)
+_AGE_PATTERNS_COMPILED = [
+    (re.compile(p), op, val)
+    for p, op, val in _AGE_PATTERNS
+]
+_INCOME_PATTERNS_COMPILED = [
+    (re.compile(p), op, val)
+    for p, op, val in _INCOME_PATTERNS
+]
 
 # ── Helper ───────────────────────────────────────────────────────────────────
 
@@ -140,11 +155,10 @@ class EntityExtractor:
     def extract(self, question: str) -> ExtractionResult:
         q = question.lower()
         res = ExtractionResult()
-        
-        # Check complex keywords
-        for kw in _COMPLEX_KEYWORDS:
-            if re.search(rf"\b{re.escape(kw)}\b", q):
-                res.has_complex_keywords = True
+
+        # Check complex keywords — single compiled regex, O(n) scan instead of loop
+        if _COMPLEX_KW_RE.search(q):
+            res.has_complex_keywords = True
                 
         rem = q
         entities: Dict[str, List[Condition]] = {}
@@ -155,8 +169,8 @@ class EntityExtractor:
             entities[col].append(cond)
 
         # ── 1. Income ────────────────────────────────────────────────────────
-        for pattern, op, fixed_val in _INCOME_PATTERNS:
-            m = re.search(pattern, rem)
+        for compiled_pat, op, fixed_val in _INCOME_PATTERNS_COMPILED:
+            m = compiled_pat.search(rem)
             if m:
                 if fixed_val is not None:
                     add_cond("income", Condition(op, fixed_val))
@@ -166,12 +180,12 @@ class EntityExtractor:
                     add_cond("income", Condition("BETWEEN", (v1, v2)))
                 else:
                     add_cond("income", Condition(op, _parse_income(m.group(1))))
-                rem = re.sub(pattern, " ", rem)
+                rem = compiled_pat.sub(" ", rem)
                 break
 
         # ── 2. Age ───────────────────────────────────────────────────────────
-        for pattern, op, fixed_val in _AGE_PATTERNS:
-            m = re.search(pattern, rem)
+        for compiled_pat, op, fixed_val in _AGE_PATTERNS_COMPILED:
+            m = compiled_pat.search(rem)
             if m:
                 if fixed_val is not None:
                     add_cond("age", Condition(op, fixed_val))
@@ -181,18 +195,23 @@ class EntityExtractor:
                         add_cond("age", Condition("BETWEEN", (int(groups[0]), int(groups[1]))))
                     elif groups:
                         add_cond("age", Condition(op, int(groups[0])))
-                rem = re.sub(pattern, " ", rem)
+                rem = compiled_pat.sub(" ", rem)
                 break
 
         # ── 3. Categorical Matches ───────────────────────────────────────────
-        def match_cat(mapping: dict[str, Any], col: str, is_like: bool = False):
+        def match_cat(mapping: dict, col: str, is_like: bool = False):
             nonlocal rem
             matched = set()
             for kw, val in mapping.items():
-                pattern = rf"\b{kw}\b" if not kw.startswith(r"\b") else kw
-                if val not in matched and re.search(pattern, rem):
+                # kw is either a compiled pattern (for _MARITAL_MAP) or a plain string
+                if isinstance(kw, re.Pattern):
+                    compiled_kw = kw
+                else:
+                    pattern = rf"\b{kw}\b" if not kw.startswith(r"\b") else kw
+                    compiled_kw = re.compile(pattern)
+                if val not in matched and compiled_kw.search(rem):
                     matched.add(val)
-                    rem = re.sub(pattern, " ", rem)
+                    rem = compiled_kw.sub(" ", rem)
             if matched:
                 if len(matched) == 1:
                     op = "LIKE" if is_like else "="

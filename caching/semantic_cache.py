@@ -20,16 +20,23 @@ _CITIES_SET = {c.lower() for c in RAJASTHAN_CITIES}
 _BLOCKS_SET = {b.lower() for b in RAJASTHAN_BLOCKS}
 _LOCATIONS_SET = _DISTRICTS_SET | _CITIES_SET | _BLOCKS_SET
 
+# Pre-compiled regex patterns — compiled once at import time
+_DIGITS_RE = re.compile(r'\b\d+(?:\.\d+)?\b')
+_OPERATOR_WORDS = (
+    "above", "below", "greater", "less", "more", "fewer", "between",
+    "under", "over", "at least", "at most", "exactly", "older", "younger"
+)
+_OPERATOR_WORDS_RE = re.compile(
+    r'\b(?:' + '|'.join(_OPERATOR_WORDS) + r')\b'
+)
+_WORDS_RE = re.compile(r"\b[a-zA-Z]+\b")
+_LOC_WORDS_RE = re.compile(r"\b[a-zA-Z-]+\b")
+
 
 def _extract_numbers_and_operators(text: str) -> str:
     """Extract numbers, math symbols, and comparison keywords to distinguish filters."""
-    digits = re.findall(r'\b\d+(?:\.\d+)?\b', text)
-    words = [
-        "above", "below", "greater", "less", "more", "fewer", "between", "under", "over",
-        "at least", "at most", "exactly", "older", "younger"
-    ]
-    pattern = r'\b(?:' + '|'.join(words) + r')\b'
-    found_words = re.findall(pattern, text.lower())
+    digits = _DIGITS_RE.findall(text)
+    found_words = _OPERATOR_WORDS_RE.findall(text.lower())
     return ",".join(sorted(digits + found_words))
 
 
@@ -45,9 +52,8 @@ def _extract_intent(text: str) -> str:
 
 def _extract_gender(text: str) -> str:
     """Identify explicit gender filters."""
-    import re
     lowered = text.lower()
-    words = set(re.findall(r"\b[a-zA-Z]+\b", lowered))
+    words = set(_WORDS_RE.findall(lowered))
     male_terms = {"male", "boy", "man", "men", "gent", "gentleman"}
     female_terms = {"female", "girl", "woman", "women", "lady", "widow"}
     has_male = bool(words & male_terms)
@@ -63,7 +69,7 @@ def _extract_gender(text: str) -> str:
 
 def _extract_locations(text: str) -> str:
     """Extract Rajasthan geographical proper nouns mentioned in the question."""
-    words = set(re.findall(r"\b[a-zA-Z-]+\b", text.lower()))
+    words = set(_LOC_WORDS_RE.findall(text.lower()))
     found = words & _LOCATIONS_SET
     return ",".join(sorted(list(found)))
 

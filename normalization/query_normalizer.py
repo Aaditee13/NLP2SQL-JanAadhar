@@ -181,4 +181,11 @@ class QueryNormalizer:
 
 
 def normalize_query(query: str) -> QueryNormalizationResult:
-    return QueryNormalizer().normalize(query)
+    return _NORMALIZER.normalize(query)
+
+
+# ── Module-level singleton — built once at import time ──────────────────────
+# QueryNormalizer.__init__ constructs two lookup dicts over COLUMNS and
+# RAJASTHAN_DISTRICTS_41 (pure computation, no I/O).  Doing this once avoids
+# re-building the dicts on every call to normalize_query().
+_NORMALIZER = QueryNormalizer()

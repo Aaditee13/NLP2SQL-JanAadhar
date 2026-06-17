@@ -1,0 +1,35 @@
+[
+  {
+    "id": "8b4e43096754a279f47aa30e20f5bb7a",
+    "question": "List all female citizens living in Jaipur district",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE gender = 'Female' AND district_name_eng = 'Jaipur';",
+    "metadata": {
+      "numbers": "",
+      "intent": "list",
+      "gender": "female",
+      "locations": "jaipur"
+    }
+  },
+  {
+    "id": "33183782a43c8d225d02e9a2041969e1",
+    "question": "List all Rajput citizens who belong to GEN category.",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE (caste LIKE '%Rajpoot%' OR caste LIKE '%\u0930\u093e\u091c\u092a\u0942\u0924%' OR caste LIKE '%Rajput%') AND caste_category = 'GEN';",
+    "metadata": {
+      "numbers": "",
+      "intent": "list",
+      "gender": "none",
+      "locations": ""
+    }
+  },
+  {
+    "id": "bbaec2dbdc3378e72a3e9d20b60e5c7a",
+    "question": "List all citizens whose family income is between 1 lakh and 3 lakhs. ",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE enrollment_id IN (SELECT enrollment_id FROM citizen GROUP BY enrollment_id HAVING SUM(income) BETWEEN 100000 AND 300000);",
+    "metadata": {
+      "numbers": "1,3,between",
+      "intent": "list",
+      "gender": "none",
+      "locations": ""
+    }
+  }
+]
