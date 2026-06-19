@@ -127,3 +127,6 @@ def render() -> None:
             if output.optimization.index_recommendations:
                 st.subheader("Index Recommendations")
                 st.write(output.optimization.index_recommendations)
+
+
+render()

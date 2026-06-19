@@ -153,22 +153,40 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
     )
 
     # ── Step 1.0: Fuzzy Name Broadening ──────────────────────────────────────
+    # Rewrites the LLM-generated LIKE clause into a dual-arm OR:
+    #   (col LIKE '%prefix%' OR col_phonetic LIKE 'phonetic_key%')
+    # The orthographic arm catches close spellings (Poonam/Poonem).
+    # The phonetic arm catches systematic romanization variants where the first
+    # 3 chars differ (Poonam→Poo vs Punam→Pun, Shweta→Shw vs Sweta→Swe).
     if fuzzy_target:
         prefix = fuzzy_target[:3]
         target_lower = fuzzy_target.lower()
+        from normalization.fuzzy_match import phonetic_key as _phonetic_key
+        from rapidfuzz.distance import JaroWinkler
+        target_phonetic = _phonetic_key(fuzzy_target)
+        _NAME_COLS_PAT = "member_name|father_name|mother_name|spouse_name|family_head_name"
+
         def fuzzy_repl(match):
             col_part = match.group(1)
             val = match.group(2).strip()
-            from rapidfuzz.distance import JaroWinkler
             score = JaroWinkler.similarity(target_lower, val.lower())
             if score > 1.0:
                 score = score / 100.0
             if score >= 0.60 or val.lower() in target_lower or target_lower in val.lower():
-                return f"{col_part} LIKE '%{prefix}%'"
+                phonetic_col = re.sub(
+                    rf"({_NAME_COLS_PAT})",
+                    r"\1_phonetic",
+                    col_part,
+                    flags=re.IGNORECASE,
+                )
+                return (
+                    f"({col_part} LIKE '%{prefix}%'"
+                    f" OR {phonetic_col} LIKE '{target_phonetic}%')"
+                )
             return match.group(0)
-        _NAME_COLS = "member_name|father_name|mother_name|spouse_name|family_head_name"
+
         sql = re.sub(
-            rf"\b((?:\w+\.)?(?:{_NAME_COLS}))\s+LIKE\s+'%?([^'%]+)%?'",
+            rf"\b((?:\w+\.)?(?:{_NAME_COLS_PAT}))\s+LIKE\s+'%?([^'%]+)%?'",
             fuzzy_repl, sql, flags=re.IGNORECASE,
         )
 

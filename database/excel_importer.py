@@ -9,6 +9,7 @@ import pandas as pd
 from sqlalchemy import text
 from database.connection import get_engine, get_session
 from database.models import BankDetails, Family, Member
+from normalization.fuzzy_match import phonetic_key
 
 
 REQUIRED_COLUMNS = {
@@ -98,11 +99,13 @@ def import_excel_dataset(
         
         district = DISTRICT_VALUE_NORMALIZATION.get(str(hof_row["DISTRICT_NAME_ENG"]), str(hof_row["DISTRICT_NAME_ENG"]))
         
+        _head_name = str(hof_row["NAME_EN"])
         families.append(
             Family(
                 family_id=family_id_counter,
                 jan_aadhaar_number=enrollment_id,
-                family_head_name=str(hof_row["NAME_EN"]),
+                family_head_name=_head_name,
+                family_head_name_phonetic=phonetic_key(_head_name),
                 district=district,
                 city=_text(hof_row.get("CITY_NAME_ENG")),
                 block=_text(hof_row.get("BLOCK_NAME_ENG")),
@@ -115,15 +118,23 @@ def import_excel_dataset(
 
         for r in m_rows:
             m_id = int(r["MEMBER_ID"])
+            _mname = str(r["NAME_EN"])
+            _fname = _text(r.get("FATHER_NAME_EN"))
+            _mname2 = _text(r.get("MOTHER_NAME_EN"))
+            _sname = _text(r.get("SPOUCE_NAME_EN"))
             members.append(
                 Member(
                     member_id=m_id,
                     family_id=family_id_counter,
                     jan_aadhaar_member_id=f"{enrollment_id}-{m_id}",
-                    member_name=str(r["NAME_EN"]),
-                    father_name=_text(r.get("FATHER_NAME_EN")),
-                    mother_name=_text(r.get("MOTHER_NAME_EN")),
-                    spouse_name=_text(r.get("SPOUCE_NAME_EN")),
+                    member_name=_mname,
+                    member_name_phonetic=phonetic_key(_mname),
+                    father_name=_fname,
+                    father_name_phonetic=phonetic_key(_fname) if _fname else None,
+                    mother_name=_mname2,
+                    mother_name_phonetic=phonetic_key(_mname2) if _mname2 else None,
+                    spouse_name=_sname,
+                    spouse_name_phonetic=phonetic_key(_sname) if _sname else None,
                     date_of_birth=_date(r.get("DOB")),
                     age=_integer(r.get("AGE")),
                     gender=str(r["GENDER"]).title(),
@@ -156,8 +167,25 @@ def import_excel_dataset(
     engine = get_engine(database_url)
     from database.models import Base
     Base.metadata.create_all(engine)
+
+    # Migration: add phonetic columns to existing databases that pre-date this feature.
+    # create_all() only creates missing tables; ALTER TABLE is needed for new columns.
+    _PHONETIC_MIGRATIONS = [
+        "ALTER TABLE member ADD COLUMN member_name_phonetic TEXT",
+        "ALTER TABLE member ADD COLUMN father_name_phonetic TEXT",
+        "ALTER TABLE member ADD COLUMN mother_name_phonetic TEXT",
+        "ALTER TABLE member ADD COLUMN spouse_name_phonetic TEXT",
+        "ALTER TABLE family ADD COLUMN family_head_name_phonetic TEXT",
+    ]
+    with engine.begin() as conn:
+        for stmt in _PHONETIC_MIGRATIONS:
+            try:
+                conn.execute(text(stmt))
+            except Exception:
+                pass  # column already exists
+
     dialect_name = engine.dialect.name
-    
+
     with engine.begin() as conn:
         if dialect_name == "sqlite":
             conn.execute(text("PRAGMA foreign_keys = OFF;"))

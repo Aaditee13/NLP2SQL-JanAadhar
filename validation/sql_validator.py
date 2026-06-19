@@ -141,6 +141,10 @@ class SQLValidator:
     def _unknown_columns(self, sql: str, referenced_tables: set[str], alias_map: dict[str, str]) -> set[str]:
         unknown: set[str] = set()
         for table, column in re.findall(r"\b([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b", sql):
+            # Phonetic columns are internal infrastructure injected by _post_process_sql,
+            # not business columns — always valid, never shown to the LLM.
+            if column.endswith("_phonetic"):
+                continue
             resolved_table = alias_map.get(table, table)
             if resolved_table not in self.tables or column not in self.columns.get(resolved_table, set()):
                 unknown.add(f"{resolved_table}.{column}")
@@ -155,16 +159,18 @@ class SQLValidator:
                     continue
                 if identifier.upper() == identifier and len(identifier) <= 8:
                     continue
+                # Phonetic columns are internal infrastructure — always valid.
+                if identifier.endswith("_phonetic"):
+                    continue
                 if identifier not in known and not re.search(rf"\b(?:from|join|as)\s+{identifier}\b", sql, re.IGNORECASE):
                     # Skip string-like values handled by SQL tokenizer poorly in this lightweight path.
                     if f"'{identifier}'" not in sql and f'"{identifier}"' not in sql:
                         unknown.add(identifier)
         return unknown
-        return unknown
 
     def _qualified_column_tables_not_in_from(self, sql: str, referenced_tables: set[str], alias_map: dict[str, str]) -> set[str]:
         missing: set[str] = set()
-        for table_or_alias, _column in re.findall(r"\b([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b", sql):
+        for table_or_alias, _ in re.findall(r"\b([a-zA-Z_][\w]*)\.([a-zA-Z_][\w]*)\b", sql):
             resolved_table = alias_map.get(table_or_alias, table_or_alias)
             if resolved_table in self.tables and resolved_table not in referenced_tables:
                 missing.add(resolved_table)

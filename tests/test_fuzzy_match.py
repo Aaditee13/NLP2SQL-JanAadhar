@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pandas as pd
 
-from normalization.fuzzy_match import is_fuzzy_intent, extract_fuzzy_target, fuzzy_rerank
+from normalization.fuzzy_match import is_fuzzy_intent, extract_fuzzy_target, fuzzy_rerank, phonetic_key
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -145,3 +145,98 @@ def test_fuzzy_rerank_graceful_when_no_name_column():
     no_name_df = pd.DataFrame({"age": [30, 25]})
     result = fuzzy_rerank(no_name_df, "Anything")
     assert "similarity_score" not in result.columns
+
+
+# ── phonetic_key equivalences ─────────────────────────────────────────────────
+
+def test_phonetic_key_vowel_doubling_oo():
+    # oo → u: Poonam and Punam are the same phoneme
+    assert phonetic_key("Poonam") == phonetic_key("Punam")
+
+
+def test_phonetic_key_vowel_doubling_ee():
+    # ee → i: Geeta and Gita are the same phoneme
+    assert phonetic_key("Geeta") == phonetic_key("Gita")
+    assert phonetic_key("Suneeta") == phonetic_key("Sunita")
+    assert phonetic_key("Preeti") == phonetic_key("Priti")
+
+
+def test_phonetic_key_consonant_sh():
+    # sh → s: Shweta and Sweta are the same phoneme cluster
+    assert phonetic_key("Shweta") == phonetic_key("Sweta")
+
+
+def test_phonetic_key_aspiration_th():
+    # th → t: Thakur and Takur are the same phoneme
+    assert phonetic_key("Thakur") == phonetic_key("Takur")
+
+
+def test_phonetic_key_aspiration_bh_gh_kh():
+    assert phonetic_key("Bhanu") == phonetic_key("Banu")
+    assert phonetic_key("Ghosh") == phonetic_key("Gosh")
+    assert phonetic_key("Phool") == phonetic_key("Pool")
+
+
+def test_phonetic_key_v_b_interchange():
+    # v/b are phonetically interchangeable in North India
+    assert phonetic_key("Vijay") == phonetic_key("Bijay")
+    assert phonetic_key("Vimal") == phonetic_key("Bimal")
+
+
+def test_phonetic_key_gemination():
+    # Double consonants reduce to single
+    assert phonetic_key("Rammesh") == phonetic_key("Ramesh")
+
+
+def test_phonetic_key_aa_normalization():
+    assert phonetic_key("Raadha") == phonetic_key("Radha")
+
+
+def test_phonetic_key_distinct_names_differ():
+    # Unrelated names must NOT collapse to the same key
+    assert phonetic_key("Sunita") != phonetic_key("Savita")
+    assert phonetic_key("Geeta") != phonetic_key("Rita")
+    assert phonetic_key("Poonam") != phonetic_key("Meena")
+
+
+def test_phonetic_key_empty_string():
+    assert phonetic_key("") == ""
+
+
+# ── fuzzy_rerank with phonetic strategy ──────────────────────────────────────
+
+def test_fuzzy_rerank_phonetic_catches_punam_when_searching_poonam():
+    # JW("poonam", "punam") ≈ 0.84 — below threshold 0.88.
+    # Phonetic keys match → score floored at 0.90 → should pass.
+    df = _make_df(["Poonam", "Punam", "Zzz"])
+    result = fuzzy_rerank(df, "Poonam", threshold=0.88)
+    names = result["member_name"].tolist()
+    assert "Punam" in names, "Phonetic match should include Punam when searching Poonam"
+
+
+def test_fuzzy_rerank_phonetic_catches_sweta_when_searching_shweta():
+    # JW("shweta", "sweta") ≈ 0.95 — above 0.88 on its own.
+    # Confirm it's still returned (either via JW or phonetic).
+    df = _make_df(["Shweta", "Sweta", "Zzz"])
+    result = fuzzy_rerank(df, "Shweta", threshold=0.88)
+    names = result["member_name"].tolist()
+    assert "Sweta" in names
+
+
+def test_fuzzy_rerank_phonetic_works_for_multi_word_db_names():
+    # Single-word target "Punam" should match "Punam Devi" and "Poonam Devi"
+    # via the per-word phonetic check.
+    df = _make_df(["Poonam Devi", "Punam Devi", "Zzz Abc"])
+    result = fuzzy_rerank(df, "Punam", threshold=0.88)
+    names = result["member_name"].tolist()
+    assert "Punam Devi" in names
+    assert "Poonam Devi" in names
+
+
+def test_fuzzy_rerank_phonetic_does_not_inflate_unrelated_names():
+    # Names with completely different phonetic keys should not get the 0.90 floor.
+    df = _make_df(["Sunita", "Rohit", "Zzz"])
+    result = fuzzy_rerank(df, "Poonam", threshold=0.88)
+    names = result["member_name"].tolist()
+    assert "Rohit" not in names
+    assert "Zzz" not in names
