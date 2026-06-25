@@ -99,7 +99,7 @@ This document maps every feature of the system to its implementation status, key
 | **Status** | Complete |
 | **Key files** | `app.py:_post_process_sql()` (lines 76-661), `app.py:_fix_no_bank_sql()` (lines 664-729) |
 | **Entry point** | Called in the generation loop at `app.py:768-769` |
-| **Notes** | Addresses systematic LLM output errors: free-text LIKE rewrites, bank name UPPER(), categorical casing normalization, education LOWER(), is_rural integer mapping, district casing/redirect, IN clause handling (district, bank, caste, categorical), alias mismatch correction, spurious JOIN pruning, transitive JOIN injection, family member count fixes. Step 1.0 now emits a dual-arm OR clause for fuzzy queries: `(col LIKE '%prefix%' OR col_phonetic LIKE 'phonetic_key%')`. |
+| **Notes** | Addresses systematic LLM output errors: free-text LIKE rewrites, bank name UPPER(), categorical casing normalization, education LOWER(), is_rural integer mapping, district casing/redirect, IN clause handling (district, bank, caste, categorical), alias mismatch correction, spurious JOIN pruning, transitive JOIN injection, family member count fixes. Step 1.0 handles fuzzy broadening: for each token in the fuzzy target it emits one orthographic arm (`col LIKE '%Token%'`) and one phonetic arm (`col_phonetic LIKE '%key%'`), covering all tokens even when the LLM only generates a LIKE for the first one. Phonetic arms use substring matching (`LIKE '%key%'`) not prefix matching, so records with middle names in the phonetic column (e.g. `"rames kumar sarma"`) are still found when the user omits the middle name. |
 
 ---
 
@@ -208,14 +208,14 @@ This document maps every feature of the system to its implementation status, key
 
 ## Intelligence Features
 
-### 18. Fuzzy Name Search (Phonetic + Jaro-Winkler)
+### 18. Fuzzy Name Search (Phonetic + Position-Aware Jaro-Winkler)
 
 | Field | Detail |
 |---|---|
 | **Status** | Complete |
-| **Key files** | `normalization/fuzzy_match.py:phonetic_key()`, `normalization/fuzzy_match.py:is_fuzzy_intent()`, `normalization/fuzzy_match.py:extract_fuzzy_target()`, `normalization/fuzzy_match.py:fuzzy_rerank()` |
-| **Entry point** | Intent detected in `app.py:generate_sql_pipeline()` lines 751-759; applied in `database/query_results.py:execute_select_preview()` |
-| **Notes** | Detects triggers: "similar to", "name like", "sounds like", "spelled like", "fuzzy search for", "approximate matches for", "resembling". Extracts target name. SQL filter uses a dual-arm OR: `(col LIKE '%prefix%' OR col_phonetic LIKE 'phonetic_key%')` — the orthographic arm catches close spellings (Poonam/Poonem), the phonetic arm catches systematic romanization variants where the first 3 chars differ (Poonam→Poo vs Punam→Pun, Shweta→Shw vs Sweta→Swe). Post-execution reranking in `fuzzy_rerank()` uses three strategies (best wins): full-string JW, per-word JW for single-word targets, and phonetic key match (floors score at 0.90). JW threshold: 0.80 default. |
+| **Key files** | `normalization/fuzzy_match.py:phonetic_key()`, `normalization/fuzzy_match.py:classify_query_name()`, `normalization/fuzzy_match.py:score_name_pair()`, `normalization/fuzzy_match.py:_score_token_pair()`, `normalization/fuzzy_match.py:is_fuzzy_intent()`, `normalization/fuzzy_match.py:extract_fuzzy_target()`, `normalization/fuzzy_match.py:fuzzy_rerank()` |
+| **Entry point** | Intent detected in `app.py:generate_sql_pipeline()`; applied in `database/query_results.py:execute_select_preview()` |
+| **Notes** | Detects triggers: "similar to", "name like", "sounds like", "spelled like", "fuzzy search for", "approximate matches for", "resembling". Extracts target name (strips honorifics: S/O, D/O, Shri, Smt, etc.). **SQL candidate generation** (Step 1.0 in `_post_process_sql`): for each query token emits one orthographic arm (`col LIKE '%Token%'`) and one phonetic arm (`col_phonetic LIKE '%key%'`), so middle-name gaps never hide a valid candidate. **Post-execution reranking** splits on multi-word vs single-word targets: (1) *Multi-word*: `score_name_pair()` computes a weighted sum over query tokens — first name weight 1.0, middle 0.55, last 0.40+. Each query token is matched against its best DB token using exact → phonetic (0.92) → initial-char (0.88) → JW priority. An alignment bonus (+0.04) rewards in-order matches; a length penalty discounts very long DB names. Full-string JW acts as a fallback floor. (2) *Single-word*: per-DB-token JW and phonetic match both apply a positional discount (`[1.0, 0.92, 0.85, 0.80]`) so first-name matches rank above middle- or surname matches. JW threshold: 0.80 default. |
 
 ---
 

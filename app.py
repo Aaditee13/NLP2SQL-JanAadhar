@@ -153,18 +153,47 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
     )
 
     # ── Step 1.0: Fuzzy Name Broadening ──────────────────────────────────────
-    # Rewrites the LLM-generated LIKE clause into a dual-arm OR:
-    #   (col LIKE '%prefix%' OR col_phonetic LIKE 'phonetic_key%')
-    # The orthographic arm catches close spellings (Poonam/Poonem).
-    # The phonetic arm catches systematic romanization variants where the first
-    # 3 chars differ (Poonam→Poo vs Punam→Pun, Shweta→Shw vs Sweta→Swe).
+    # Rewrites the LLM-generated LIKE clause into a multi-arm OR that covers
+    # every token in the fuzzy target, both orthographically and phonetically.
+    #
+    # Single-word target "Punam":
+    #   (col LIKE '%Pun%' OR col_phonetic LIKE '%punam%')
+    #
+    # Multi-word target "Ramesh Sharma":
+    #   (col LIKE '%Ramesh%' OR col LIKE '%Sharma%'
+    #    OR col_phonetic LIKE '%rames%' OR col_phonetic LIKE '%sarma%')
+    #
+    # Per-token phonetic arms use LIKE '%key%' (contains) rather than
+    # 'key%' (starts-with) so middle names stored in the phonetic column
+    # (e.g. "rames kumar sarma" for "Ramesh Kumar Sharma") are still matched
+    # when the user omits the middle name.
     if fuzzy_target:
-        prefix = fuzzy_target[:3]
         target_lower = fuzzy_target.lower()
-        from normalization.fuzzy_match import phonetic_key as _phonetic_key
+        from normalization.fuzzy_match import phonetic_key as _phonetic_key, classify_query_name as _classify_query_name
         from rapidfuzz.distance import JaroWinkler
-        target_phonetic = _phonetic_key(fuzzy_target)
         _NAME_COLS_PAT = "member_name|father_name|mother_name|spouse_name|family_head_name"
+
+        # Build per-token (orthographic, phonetic) pairs
+        _query_tokens = _classify_query_name(fuzzy_target)  # [(lower_tok, weight), ...]
+        if not _query_tokens:
+            # Fallback: treat as single token if all words were honorifics
+            _query_tokens = [(target_lower.strip(), 1.0)]
+
+        def _make_fuzzy_arms(col_part: str) -> str:
+            phonetic_col = re.sub(
+                rf"({_NAME_COLS_PAT})",
+                r"\1_phonetic",
+                col_part,
+                flags=re.IGNORECASE,
+            )
+            arms: list[str] = []
+            for tok, _ in _query_tokens:
+                arms.append(f"{col_part} LIKE '%{tok.title()}%'")
+            for tok, _ in _query_tokens:
+                pk = _phonetic_key(tok)
+                if pk:
+                    arms.append(f"{phonetic_col} LIKE '%{pk}%'")
+            return "(" + " OR ".join(arms) + ")"
 
         def fuzzy_repl(match):
             col_part = match.group(1)
@@ -173,16 +202,7 @@ def _post_process_sql(sql: str, fuzzy_target: str | None = None) -> str:
             if score > 1.0:
                 score = score / 100.0
             if score >= 0.60 or val.lower() in target_lower or target_lower in val.lower():
-                phonetic_col = re.sub(
-                    rf"({_NAME_COLS_PAT})",
-                    r"\1_phonetic",
-                    col_part,
-                    flags=re.IGNORECASE,
-                )
-                return (
-                    f"({col_part} LIKE '%{prefix}%'"
-                    f" OR {phonetic_col} LIKE '{target_phonetic}%')"
-                )
+                return _make_fuzzy_arms(col_part)
             return match.group(0)
 
         sql = re.sub(
