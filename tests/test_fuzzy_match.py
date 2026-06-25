@@ -31,6 +31,24 @@ def test_is_fuzzy_intent_detects_all_trigger_phrases():
         assert is_fuzzy_intent(phrase) is True, f"Should detect fuzzy intent: {phrase!r}"
 
 
+def test_is_fuzzy_intent_detects_members_like_pattern():
+    triggers = [
+        "show members like Kumar Ashok",
+        "find members like Sunita Devi",
+        "show people like Ram Prasad",
+        "members are like Geeta",
+        "find persons like Vijay Singh",
+        "citizens like Rekha Devi",
+        "beneficiaries like Ashok Kumar",
+    ]
+    for phrase in triggers:
+        assert is_fuzzy_intent(phrase) is True, f"Should detect fuzzy intent: {phrase!r}"
+
+    # Extraction should work too
+    assert extract_fuzzy_target("show members like Kumar Ashok") == "Kumar Ashok"
+    assert extract_fuzzy_target("find members like Sunita Devi") == "Sunita Devi"
+
+
 def test_is_fuzzy_intent_rejects_non_fuzzy_queries():
     non_fuzzy = [
         "show all members in jaipur",
@@ -364,12 +382,16 @@ def test_score_name_pair_phonetic_variant_preserved_with_weights():
 
 
 def test_score_name_pair_reordered_tokens_score_lower():
-    # "Sharma Ramesh" should score lower than "Ramesh Sharma" for query "Ramesh Sharma"
+    # "Sharma Ramesh" should score meaningfully below "Ramesh Sharma".
+    # The per-token backward-shift penalty (0.90) should produce a visible gap,
+    # not just a tiny alignment-bonus difference.
     tokens = classify_query_name("Ramesh Sharma")
     score_aligned = score_name_pair(tokens, "Ramesh Sharma")
     score_reordered = score_name_pair(tokens, "Sharma Ramesh")
-    assert score_aligned >= score_reordered, (
-        "Aligned token order must score at least as high as reordered"
+    assert score_aligned > score_reordered, "Aligned must score higher than reordered"
+    assert score_aligned - score_reordered >= 0.05, (
+        f"Gap must be >= 0.05 to meaningfully separate reordered results "
+        f"(aligned={score_aligned:.3f}, reordered={score_reordered:.3f})"
     )
 
 

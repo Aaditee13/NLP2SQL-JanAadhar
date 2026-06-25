@@ -142,6 +142,14 @@ def score_name_pair(
             if s > best_score:
                 best_score = s
                 best_j = j
+
+        # Per-token positional alignment discount:
+        #   j == i  → aligned, no discount
+        #   j  > i  → forward shift (extra middle name in DB), small penalty 0.96
+        #   j  < i  → backward shift (token reordered earlier), reorder penalty 0.90
+        if best_j != -1 and best_j != i:
+            best_score *= 0.90 if best_j < i else 0.96
+
         if best_j == i:
             aligned_count += 1
         weighted_sum += w * best_score
@@ -167,6 +175,8 @@ def score_name_pair(
 _FUZZY_PATTERNS = [
     re.compile(r"\bsimilar\s+to\s+([a-zA-Z\s]+)", re.IGNORECASE),
     re.compile(r"\bname(?:s)?\s+(?:is\s+)?like\s+([a-zA-Z\s]+)", re.IGNORECASE),
+    # "show members like Kumar Ashok", "find people like Sunita Devi", etc.
+    re.compile(r"\b(?:member(?:s)?|person(?:s)?|people|citizen(?:s)?|beneficiar(?:y|ies)?)\s+(?:are\s+|is\s+)?like\s+([a-zA-Z\s]+)", re.IGNORECASE),
     re.compile(r"\bsound(?:s)?\s+like\s+([a-zA-Z\s]+)", re.IGNORECASE),
     re.compile(r"\bspell(?:ed)?\s+like\s+([a-zA-Z\s]+)", re.IGNORECASE),
     re.compile(r"\bfuzzy\s+(?:search\s+)?(?:for\s+)?([a-zA-Z\s]+)", re.IGNORECASE),
@@ -263,7 +273,6 @@ def fuzzy_rerank(
 
     # Pre-compute values needed for the single-word path
     target_lower = target_name.lower()
-    target_words = [w.strip() for w in target_lower.split() if w.strip()]
     max_len_diff = 2 if len(target_name) <= 5 else 3
     target_phonetic = phonetic_key(target_lower)
     target_phonetic_words = [w for w in target_phonetic.split() if w]
