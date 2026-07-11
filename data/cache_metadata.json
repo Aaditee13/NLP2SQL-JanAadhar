@@ -75,5 +75,27 @@
       "gender": "none",
       "locations": ""
     }
+  },
+  {
+    "id": "084b86b2cf63eabc31c41346014f253d",
+    "question": "Show all literate female above 21 in Jaipur.",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE education LIKE '%Literate%' AND gender = 'Female' AND age > 21 AND district_name_eng = 'Jaipur' LIMIT 200;",
+    "metadata": {
+      "numbers": "21,above",
+      "intent": "list",
+      "gender": "female",
+      "locations": "jaipur"
+    }
+  },
+  {
+    "id": "eb2ef664053ac78050b03497fca137e8",
+    "question": "Show all employed males above 41 in Jaipur.",
+    "sql": "SELECT name_en, age, gender, district_name_eng FROM citizen WHERE gender = 'Male' AND marital_status = 'Unmarried' AND occupation LIKE '%Employed%' AND age > 41 AND district_name_eng = 'Jaipur';",
+    "metadata": {
+      "numbers": "41,above",
+      "intent": "list",
+      "gender": "none",
+      "locations": "jaipur"
+    }
   }
 ]
